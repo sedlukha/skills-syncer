@@ -1,0 +1,41 @@
+{
+  "name": "skills-syncer",
+  "version": "0.1.0",
+  "description": "Vendor Claude Code skills and subagents from any catalog repo into your repo, with a lockfile and content hashing. Run via npx.",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "skills",
+    "agents",
+    "subagents",
+    "vendor",
+    "sync",
+    "monorepo",
+    "cli"
+  ],
+  "license": "MIT",
+  "author": "Artur Sedlukha",
+  "homepage": "https://github.com/sedlukha/skills-syncer#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sedlukha/skills-syncer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sedlukha/skills-syncer/issues"
+  },
+  "type": "module",
+  "bin": {
+    "skills-syncer": "bin/skills-syncer.mjs"
+  },
+  "files": [
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
