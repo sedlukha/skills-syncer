@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// @ts-check
 // skills-syncer — vendor Claude Code skills + agents from ANY catalog into your repo.
 //
 //   npx skills-syncer --from github:acme/our-skills --skill '*'
@@ -39,6 +40,17 @@ import { join, resolve, relative, basename } from 'node:path'
 
 const cwd = process.cwd()
 
+/**
+ * @typedef {{ from?: string, skills?: string[], agents?: string[] }} Config
+ *   Hand-editable intent file (skills-syncer.json): source + literal selection.
+ * @typedef {Record<string, string[]>} Manifest  skill -> agents it requires
+ * @typedef {{ hash: string }} SkillEntry
+ * @typedef {{ hash: string, explicit: boolean, requiredBy: string[] }} AgentEntry
+ * @typedef {{ version: number, source: string, skills: Record<string, SkillEntry>, agents: Record<string, AgentEntry> }} Lock
+ *   Generated manifest (skills-syncer-lock.json): per-item content hash.
+ * @typedef {{ root: string, cleanup: () => void }} Source
+ */
+
 // Markers that fence the shared block inside a repo's AGENTS.md.
 const SHARED_BEGIN = '<!-- shared — managed by skills-syncer. Edit it in the source catalog, not here. -->'
 const SHARED_END = '<!-- end shared. Put repo-specific notes below this line. -->'
@@ -46,10 +58,12 @@ const SHARED_END = '<!-- end shared. Put repo-specific notes below this line. --
 // --- tiny CLI parser --------------------------------------------------------
 // `--from X` takes one value; `--skill a b c` / `--agent a b c` take a list
 // that runs until the next `--flag`. Each list accepts '*'.
+/** @param {string[]} argv @param {string} flag @returns {string | null} */
 function parseValueArg(argv, flag) {
   const i = argv.indexOf(flag)
   return i === -1 ? null : argv[i + 1]
 }
+/** @param {string[]} argv @param {string} flag @returns {string[] | null} */
 function parseListArg(argv, flag) {
   const i = argv.indexOf(flag)
   if (i === -1) return null
@@ -64,6 +78,7 @@ function parseListArg(argv, flag) {
 // --- source resolution ------------------------------------------------------
 // Returns { root, cleanup }. A `github:owner/repo[#ref]` source is shallow-cloned
 // to a temp dir; a local path is used in place.
+/** @param {string} from @returns {Source} */
 function resolveSource(from) {
   if (from.startsWith('github:')) {
     const spec = from.slice('github:'.length)
@@ -77,7 +92,8 @@ function resolveSource(from) {
       execFileSync('git', args, { stdio: ['ignore', 'ignore', 'pipe'] })
     } catch (err) {
       rmSync(dir, { recursive: true, force: true })
-      fail(`could not clone ${url}${ref ? ` (ref ${ref})` : ''}\n  ${String(err.stderr || err.message).trim()}`)
+      const e = /** @type {{ stderr?: Buffer, message?: string }} */ (err)
+      fail(`could not clone ${url}${ref ? ` (ref ${ref})` : ''}\n  ${String(e.stderr || e.message).trim()}`)
     }
     return { root: dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
   }
@@ -87,6 +103,7 @@ function resolveSource(from) {
 }
 
 // Auto-detect where skills/agents live in the source.
+/** @param {string} root @param {...string[]} candidates @returns {string} */
 function pick(root, ...candidates) {
   for (const c of candidates) {
     const p = join(root, ...c)
@@ -96,16 +113,21 @@ function pick(root, ...candidates) {
 }
 
 // --- fs + hashing helpers ---------------------------------------------------
+/** @param {string} dir @returns {string[]} */
 function listDirs(dir) {
   if (!existsSync(dir)) return []
   return readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name)
 }
+/** @param {string} dir @returns {string[]} */
 function listAgents(dir) {
   if (!existsSync(dir)) return []
   return readdirSync(dir).filter((f) => f.endsWith('.md')).map((f) => basename(f, '.md'))
 }
+/** @param {string} dir @returns {string[]} */
 function walkRel(dir) {
+  /** @type {string[]} */
   const out = []
+  /** @param {string} abs */
   const walk = (abs) => {
     for (const e of readdirSync(abs, { withFileTypes: true })) {
       const p = join(abs, e.name)
@@ -116,6 +138,7 @@ function walkRel(dir) {
   if (existsSync(dir)) walk(dir)
   return out.sort()
 }
+/** @param {string} dir @returns {string} */
 function dirHash(dir) {
   const h = createHash('sha256')
   for (const rel of walkRel(dir)) {
@@ -124,9 +147,11 @@ function dirHash(dir) {
   }
   return h.digest('hex')
 }
+/** @param {string} file @returns {string} */
 function fileHash(file) {
   return createHash('sha256').update(readFileSync(file)).digest('hex')
 }
+/** @param {string} p @returns {any} */
 function readJson(p) {
   if (!existsSync(p)) return null
   try {
@@ -138,6 +163,7 @@ function readJson(p) {
 // Throw rather than process.exit, so the outer finally always runs cleanup
 // (a github: source has a temp clone to remove).
 class SyncError extends Error {}
+/** @param {string} msg @returns {never} */
 function fail(msg) {
   throw new SyncError(msg)
 }
@@ -172,6 +198,7 @@ try {
   }
 
   const rawManifest = readJson(manifestPath) || {}
+  /** @type {Manifest} */
   const manifest = {}
   for (const [skill, agents] of Object.entries(rawManifest)) {
     if (!skill.startsWith('$')) manifest[skill] = agents // skip $comment et al.
@@ -191,6 +218,7 @@ try {
   }
 
   // Drop names missing from the source; warn so a typo or deletion is visible.
+  /** @param {string[]} names @param {string[]} available @param {string} kind @returns {string[]} */
   const keepKnown = (names, available, kind) => {
     for (const n of names.filter((n) => !available.includes(n)))
       console.warn(`[skills-syncer] skip ${kind} "${n}": not in source (deleted or misspelled)`)
@@ -200,6 +228,7 @@ try {
   const explicitAgents = new Set(keepKnown(agentSel, availableAgents, 'agent'))
 
   // Agents required by selected skills, via the manifest.
+  /** @type {Map<string, string[]>} */
   const requiredBy = new Map()
   for (const skill of skillSel) {
     for (const role of manifest[skill] || []) {
@@ -208,7 +237,7 @@ try {
         continue
       }
       if (!requiredBy.has(role)) requiredBy.set(role, [])
-      requiredBy.get(role).push(skill)
+      requiredBy.get(role)?.push(skill)
     }
   }
   const agentsToInstall = new Set([...explicitAgents, ...requiredBy.keys()])
@@ -216,7 +245,9 @@ try {
   // --- install --------------------------------------------------------------
   const skillsDest = join(cwd, '.claude', 'skills')
   const agentsDest = join(cwd, '.claude', 'agents')
+  /** @type {Lock | null} */
   const prevLock = readJson(join(cwd, 'skills-syncer-lock.json'))
+  /** @type {Lock} */
   const lock = { version: 1, source: from, skills: {}, agents: {} }
 
   for (const name of [...skillSel].sort()) {
@@ -261,6 +292,7 @@ try {
   }
 
   // --- cleanup: drop what is no longer selected -----------------------------
+  /** @type {{ skills: string[], agents: string[] }} */
   const removed = { skills: [], agents: [] }
   for (const name of prevLock?.skills ? Object.keys(prevLock.skills) : []) {
     if (lock.skills[name]) continue
@@ -315,6 +347,7 @@ try {
 
 // Put the shared block at the top of the repo's AGENTS.md, keeping repo-specific
 // notes below it. Idempotent: re-running replaces only the fenced block.
+/** @param {string} srcAgentsMd @returns {boolean} */
 function syncAgentsMd(srcAgentsMd) {
   if (!existsSync(srcAgentsMd)) return false
   const shared = readFileSync(srcAgentsMd, 'utf8').trim()

@@ -23,7 +23,8 @@ script itself, run via `npx skills-syncer`.
 - **No runtime dependencies.** The tool uses only Node built-ins (`node:fs`,
   `node:crypto`, `node:child_process`, `node:os`, `node:path`). Do not add a
   dependency to make the script run — if a feature needs one, reconsider the
-  feature.
+  feature. `devDependencies` (TypeScript for type-checking) are fine: they are
+  excluded from the published package by the `files` allowlist.
 - **No build step.** Keep it a runnable `.mjs` with a `#!/usr/bin/env node`
   shebang. It must work via `node bin/skills-syncer.mjs` and `npx skills-syncer`
   with nothing compiled.
@@ -38,6 +39,9 @@ script itself, run via `npx skills-syncer`.
 
 - ES modules, 2-space indent, single quotes, no semicolons — match the existing
   style in `bin/skills-syncer.mjs`.
+- The source is type-checked with `// @ts-check` + JSDoc (no `.ts`, no build).
+  Keep it green: `npm run typecheck`. Add JSDoc types for new functions and
+  annotate object literals TypeScript would otherwise infer as `never[]`.
 - User-facing lines are prefixed `[skills-syncer]`. Keep messages short and
   actionable; name the file or item involved.
 - The two state files are distinct: `skills-syncer.json` is hand-editable intent

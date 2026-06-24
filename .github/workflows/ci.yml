@@ -22,3 +22,15 @@ jobs:
       # No dependencies to install — the tool and its tests use only Node
       # built-ins, so go straight to the suite.
       - run: npm test
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # Dev-only: TypeScript checks the JSDoc-annotated source (// @ts-check).
+      # The published package still ships zero dependencies.
+      - run: npm install
+      - run: npm run typecheck

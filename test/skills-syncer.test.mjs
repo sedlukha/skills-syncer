@@ -24,10 +24,12 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const BIN = join(HERE, '..', 'bin', 'skills-syncer.mjs')
 
 // A shared, read-only catalog fixture built once.
+/** @type {string} */
 let CATALOG
 
 before(() => {
   CATALOG = mkdtempSync(join(tmpdir(), 'sst-catalog-'))
+  /** @param {string} rel @param {string} body */
   const w = (rel, body) => {
     const p = join(CATALOG, rel)
     mkdirSync(dirname(p), { recursive: true })
@@ -46,6 +48,7 @@ before(() => {
 function newRepo() {
   return mkdtempSync(join(tmpdir(), 'sst-repo-'))
 }
+/** @param {string} repo @param {string[]} [args] @param {object} [opts] */
 function run(repo, args = [], opts = {}) {
   const res = spawnSync(process.execPath, [BIN, ...args], {
     cwd: repo,
@@ -54,10 +57,15 @@ function run(repo, args = [], opts = {}) {
   })
   return { status: res.status, stdout: res.stdout || '', stderr: res.stderr || '' }
 }
+/** @param {string} repo @param {...string} rel @returns {string} */
 const read = (repo, ...rel) => readFileSync(join(repo, ...rel), 'utf8')
+/** @param {string} repo @param {...string} rel @returns {boolean} */
 const has = (repo, ...rel) => existsSync(join(repo, ...rel))
+/** @param {string} repo */
 const lock = (repo) => JSON.parse(read(repo, 'skills-syncer-lock.json'))
+/** @param {string} repo */
 const config = (repo) => JSON.parse(read(repo, 'skills-syncer.json'))
+/** @param {string} s @param {string} sub @returns {number} */
 const occurrences = (s, sub) => s.split(sub).length - 1
 
 // --- tests -----------------------------------------------------------------

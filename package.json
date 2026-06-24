@@ -28,7 +28,12 @@
     "skills-syncer": "bin/skills-syncer.mjs"
   },
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "typecheck": "tsc"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "typescript": "^5"
   },
   "files": [
     "bin",
