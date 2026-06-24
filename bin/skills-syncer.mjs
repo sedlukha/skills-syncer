@@ -222,6 +222,17 @@ try {
   for (const name of [...skillSel].sort()) {
     const src = join(srcSkillsDir, name)
     const dest = join(skillsDest, name)
+    const prev = prevLock?.skills?.[name]
+    // Never clobber a repo-authored skill: if it exists on disk but our lock did
+    // not install it, it is the repo's own — skip it and say so.
+    if (existsSync(dest) && !prev) {
+      console.warn(`[skills-syncer] skip skill "${name}": .claude/skills/${name}/ exists but is not managed by skills-syncer (repo-authored). Remove it to vendor this skill.`)
+      continue
+    }
+    // Our own copy, edited locally since last sync: about to be overwritten.
+    if (prev && existsSync(dest) && dirHash(dest) !== prev.hash) {
+      console.warn(`[skills-syncer] skill "${name}" was edited locally since last sync — overwriting. Make the change in the source catalog instead.`)
+    }
     rmSync(dest, { recursive: true, force: true })
     mkdirSync(dest, { recursive: true })
     cpSync(src, dest, { recursive: true })
@@ -232,6 +243,14 @@ try {
   for (const role of [...agentsToInstall].sort()) {
     const src = join(srcAgentsDir, `${role}.md`)
     const dest = join(agentsDest, `${role}.md`)
+    const prev = prevLock?.agents?.[role]
+    if (existsSync(dest) && !prev) {
+      console.warn(`[skills-syncer] skip agent "${role}": .claude/agents/${role}.md exists but is not managed by skills-syncer (repo-authored). Remove it to vendor this agent.`)
+      continue
+    }
+    if (prev && existsSync(dest) && fileHash(dest) !== prev.hash) {
+      console.warn(`[skills-syncer] agent "${role}" was edited locally since last sync — overwriting. Make the change in the source catalog instead.`)
+    }
     rmSync(dest, { force: true })
     cpSync(src, dest)
     lock.agents[role] = {
