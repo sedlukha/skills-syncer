@@ -1,0 +1,4 @@
+{
+  "$comment": "Maps a skill to the agents it needs. When a skill here is selected, the sync also installs (auto-pulls) the listed agents. Agents are a first-class catalog: they can also be selected directly with --agent, and shared by more than one skill.",
+  "review-flow": ["worker", "reviewer"]
+}
