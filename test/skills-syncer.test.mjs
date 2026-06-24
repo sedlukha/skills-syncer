@@ -257,6 +257,43 @@ test('a bundled catalog is used as the source when no --from is given', () => {
   assert.ok(has(repo, '.claude', 'skills', 'foo', 'SKILL.md'))
 })
 
+test('--all re-syncs every subfolder that has a skills-syncer.json', () => {
+  const fleet = mkdtempSync(join(tmpdir(), 'sst-fleet-'))
+  // two participating repos (each records its own source + selection) ...
+  for (const name of ['repo-a', 'repo-b']) {
+    const repo = join(fleet, name)
+    mkdirSync(repo, { recursive: true })
+    writeFileSync(
+      join(repo, 'skills-syncer.json'),
+      JSON.stringify({ from: CATALOG, skills: ['hello-rules'], agents: [] }),
+    )
+  }
+  // ... and one that is not a participant
+  mkdirSync(join(fleet, 'not-a-repo'), { recursive: true })
+
+  const r = run(fleet, ['--all', '--root', fleet])
+  assert.equal(r.status, 0, r.stderr)
+  assert.match(r.stdout, /synced 2 repo\(s\), skipped 1/)
+  assert.ok(has(join(fleet, 'repo-a'), '.claude', 'skills', 'hello-rules'))
+  assert.ok(has(join(fleet, 'repo-b'), '.claude', 'skills', 'hello-rules'))
+  // the non-participant is untouched
+  assert.ok(!has(join(fleet, 'not-a-repo'), '.claude'))
+})
+
+test('--all --dry-run previews each repo without writing', () => {
+  const fleet = mkdtempSync(join(tmpdir(), 'sst-fleet-'))
+  const repo = join(fleet, 'repo-a')
+  mkdirSync(repo, { recursive: true })
+  writeFileSync(
+    join(repo, 'skills-syncer.json'),
+    JSON.stringify({ from: CATALOG, skills: ['hello-rules'], agents: [] }),
+  )
+  const r = run(fleet, ['--all', '--root', fleet, '--dry-run'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.match(r.stdout, /previewed 1 repo/)
+  assert.ok(!has(repo, '.claude'), 'dry-run wrote nothing')
+})
+
 test('adopting over a different tool’s fenced block does not duplicate it', () => {
   const repo = newRepo()
   // a repo previously managed by another tool: its own markers around the shared

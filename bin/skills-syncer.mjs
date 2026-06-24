@@ -35,7 +35,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, resolve, relative, basename, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -200,12 +200,16 @@ const HELP = `skills-syncer — vendor Claude Code skills + agents from a catalo
 Usage:
   skills-syncer --from <src> --skill <names…> [--agent <names…>]
   skills-syncer                      re-sync using ./skills-syncer.json
+  skills-syncer --all [--root <dir>] re-sync every repo under a folder
 
 Options:
   --from <src>      catalog source: github:owner/repo[#ref] or a local path
   --skill <names…>  skills to install ('*' = all in the catalog)
   --agent <names…>  agents to install directly ('*' = all); agents required
                     by a selected skill are pulled automatically
+  --all             re-sync every immediate subfolder that has a
+                    skills-syncer.json (each from its own recorded source)
+  --root <dir>      with --all, the folder to scan (default: current dir)
   --dry-run, -n     show what would change; write nothing
   --help, -h        show this help
   --version, -v     print the version
@@ -221,6 +225,41 @@ if (topArgv.includes('--help') || topArgv.includes('-h')) {
 if (topArgv.includes('--version') || topArgv.includes('-v')) {
   console.log(readVersion())
   process.exit(0)
+}
+
+// --- fleet mode: re-sync every repo under a folder --------------------------
+// `--all` runs this same tool, bare, in each immediate subfolder that already
+// has a skills-syncer.json — so each repo re-syncs from its OWN recorded source
+// and selection. Different repos may point at different catalogs. `--dry-run`
+// is passed through. Worktrees and nested repos are not reached (one level deep).
+if (topArgv.includes('--all')) {
+  const rootArg = parseValueArg(topArgv, '--root')
+  const root = rootArg ? resolve(rootArg) : cwd
+  const pass = topArgv.includes('--dry-run') || topArgv.includes('-n') ? ['--dry-run'] : []
+  const self = fileURLToPath(import.meta.url)
+  /** @type {string[]} */
+  const ok = []
+  /** @type {string[]} */
+  const failed = []
+  let skipped = 0
+  for (const e of readdirSync(root, { withFileTypes: true })) {
+    if (!e.isDirectory()) continue
+    const repo = join(root, e.name)
+    if (!existsSync(join(repo, 'skills-syncer.json'))) {
+      skipped++
+      continue
+    }
+    console.log(`[skills-syncer] --all → ${e.name}`)
+    const res = spawnSync(process.execPath, [self, ...pass], { cwd: repo, stdio: 'inherit' })
+    if (res.status === 0) ok.push(e.name)
+    else failed.push(e.name)
+  }
+  console.log(
+    `[skills-syncer] --all: ${pass.length ? 'previewed' : 'synced'} ${ok.length} repo(s)` +
+      `, skipped ${skipped} (no skills-syncer.json)` +
+      (failed.length ? `, failed: ${failed.join(', ')}` : ''),
+  )
+  process.exit(failed.length ? 1 : 0)
 }
 
 // --- resolve source + selection ---------------------------------------------

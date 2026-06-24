@@ -95,11 +95,22 @@ Append `#ref` to a `github:` source to clone a specific branch or tag.
 npx skills-syncer --from github:acme/our-skills#v2 --skill '*'
 ```
 
-### 8. Roll a catalog change out to many repos
+### 8. Roll a catalog change out to many repos at once
 
 The tool is pull-only: a change reaches a repo only when the sync runs there.
-After updating the catalog, re-sync each consuming repo (scenario 4) — e.g. from
-a script that loops over your repos and runs `npx skills-syncer` in each.
+`--all` re-syncs **every immediate subfolder that has a `skills-syncer.json`** —
+each from its own recorded source and selection — so one command updates a whole
+folder of repos. Run it from the folder that holds them (or pass `--root`):
+
+```bash
+cd ~/code/myorg          # a folder of sibling repos
+npx skills-syncer --all              # re-sync each repo from its own source
+npx skills-syncer --all --dry-run    # preview every repo, write nothing
+npx skills-syncer --all --root ~/code/myorg   # scan a specific folder
+```
+
+It walks one level deep (worktrees and nested repos are not reached) and reports
+how many repos synced, were skipped (no `skills-syncer.json`), or failed.
 
 ### 9. Preview a sync without writing
 
@@ -117,6 +128,8 @@ npx skills-syncer --from github:acme/our-skills --skill '*' --dry-run
 | `--from <src>` | catalog source: `github:owner/repo[#ref]` or a local path |
 | `--skill <names…>` | skills to install (`'*'` = all in the catalog) |
 | `--agent <names…>` | agents to install directly (`'*'` = all); a selected skill's required agents come automatically |
+| `--all` | re-sync every immediate subfolder that has a `skills-syncer.json` |
+| `--root <dir>` | with `--all`, the folder to scan (default: current dir) |
 | `--dry-run`, `-n` | show what would change; write nothing |
 | `--help`, `-h` | show usage |
 | `--version`, `-v` | print the version |
