@@ -257,6 +257,25 @@ test('a bundled catalog is used as the source when no --from is given', () => {
   assert.ok(has(repo, '.claude', 'skills', 'foo', 'SKILL.md'))
 })
 
+test('a re-sync leaves a reformatted state file untouched (no churn)', () => {
+  const repo = newRepo()
+  run(repo, ['--from', CATALOG, '--skill', 'review-flow'])
+  // simulate a formatter (biome/prettier) collapsing the JSON — same data,
+  // different whitespace
+  for (const f of ['skills-syncer.json', 'skills-syncer-lock.json']) {
+    const p = join(repo, f)
+    writeFileSync(p, JSON.stringify(JSON.parse(readFileSync(p, 'utf8'))))
+  }
+  const before = {
+    intent: read(repo, 'skills-syncer.json'),
+    lock: read(repo, 'skills-syncer-lock.json'),
+  }
+  const r = run(repo, []) // bare re-sync
+  assert.equal(r.status, 0, r.stderr)
+  assert.equal(read(repo, 'skills-syncer.json'), before.intent, 'intent file not rewritten')
+  assert.equal(read(repo, 'skills-syncer-lock.json'), before.lock, 'lock file not rewritten')
+})
+
 test('--all re-syncs every subfolder that has a skills-syncer.json', () => {
   const fleet = mkdtempSync(join(tmpdir(), 'sst-fleet-'))
   // two participating repos (each records its own source + selection) ...

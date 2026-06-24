@@ -163,6 +163,21 @@ function readJson(p) {
     return null
   }
 }
+// Write pretty JSON, but leave the file untouched if it already holds the same
+// data. Keeps a re-sync a true no-op even when an external formatter (e.g. a
+// repo's biome/prettier hook) rewrote the whitespace — no spurious git churn.
+/** @param {string} p @param {any} obj @returns {void} */
+function writeJsonStable(p, obj) {
+  const next = JSON.stringify(obj)
+  if (existsSync(p)) {
+    try {
+      if (JSON.stringify(JSON.parse(readFileSync(p, 'utf8'))) === next) return
+    } catch {
+      /* unreadable/!json — fall through and overwrite */
+    }
+  }
+  writeFileSync(p, `${JSON.stringify(obj, null, 2)}\n`)
+}
 // Throw rather than process.exit, so the outer finally always runs cleanup
 // (a github: source has a temp clone to remove).
 class SyncError extends Error {}
@@ -433,8 +448,8 @@ try {
     const intent = bundled
       ? { skills: skillLiteral, agents: agentLiteral }
       : { from, skills: skillLiteral, agents: agentLiteral }
-    writeFileSync(join(cwd, 'skills-syncer.json'), `${JSON.stringify(intent, null, 2)}\n`)
-    writeFileSync(join(cwd, 'skills-syncer-lock.json'), `${JSON.stringify(lock, null, 2)}\n`)
+    writeJsonStable(join(cwd, 'skills-syncer.json'), intent)
+    writeJsonStable(join(cwd, 'skills-syncer-lock.json'), lock)
   }
 
   // --- report ---------------------------------------------------------------
