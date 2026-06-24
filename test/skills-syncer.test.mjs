@@ -183,3 +183,41 @@ test('refuses to sync a local source into itself', () => {
   assert.equal(r.status, 1)
   assert.match(r.stderr, /refusing to sync the source into itself/)
 })
+
+test('--help prints usage and exits 0 without a source', () => {
+  const r = run(newRepo(), ['--help'])
+  assert.equal(r.status, 0)
+  assert.match(r.stdout, /Usage:/)
+  assert.match(r.stdout, /--dry-run/)
+})
+
+test('--version prints a semver and exits 0', () => {
+  const r = run(newRepo(), ['--version'])
+  assert.equal(r.status, 0)
+  assert.match(r.stdout.trim(), /^\d+\.\d+\.\d+/)
+})
+
+test('--dry-run reports the plan but writes nothing', () => {
+  const repo = newRepo()
+  const r = run(repo, ['--from', CATALOG, '--skill', 'review-flow', '--dry-run'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.match(r.stdout, /\(dry-run\) would sync/)
+  assert.match(r.stdout, /nothing written/)
+  // not a single artefact on disk
+  assert.ok(!has(repo, '.claude'), 'no .claude written')
+  assert.ok(!has(repo, 'skills-syncer.json'), 'no intent file written')
+  assert.ok(!has(repo, 'skills-syncer-lock.json'), 'no lock written')
+  assert.ok(!has(repo, 'AGENTS.md'), 'no AGENTS.md written')
+})
+
+test('--dry-run previews removals without deleting', () => {
+  const repo = newRepo()
+  run(repo, ['--from', CATALOG, '--skill', 'hello-rules', 'review-flow'])
+  const r = run(repo, ['--from', CATALOG, '--skill', 'hello-rules', '-n'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.match(r.stdout, /would remove skills: review-flow/)
+  // still on disk — the dry run did not touch it
+  assert.ok(has(repo, '.claude', 'skills', 'review-flow'), 'dropped skill untouched')
+  // and the lock still records it
+  assert.ok(lock(repo).skills['review-flow'])
+})

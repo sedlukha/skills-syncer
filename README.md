@@ -101,6 +101,28 @@ The tool is pull-only: a change reaches a repo only when the sync runs there.
 After updating the catalog, re-sync each consuming repo (scenario 4) — e.g. from
 a script that loops over your repos and runs `npx skills-syncer` in each.
 
+### 9. Preview a sync without writing
+
+`--dry-run` (or `-n`) computes the full plan — what would be installed,
+overwritten, or removed — and writes nothing. Re-run without it to apply.
+
+```bash
+npx skills-syncer --from github:acme/our-skills --skill '*' --dry-run
+```
+
+## Flags
+
+| Flag | Meaning |
+| --- | --- |
+| `--from <src>` | catalog source: `github:owner/repo[#ref]` or a local path |
+| `--skill <names…>` | skills to install (`'*'` = all in the catalog) |
+| `--agent <names…>` | agents to install directly (`'*'` = all); a selected skill's required agents come automatically |
+| `--dry-run`, `-n` | show what would change; write nothing |
+| `--help`, `-h` | show usage |
+| `--version`, `-v` | print the version |
+
+With no flags, the source and selection are read from `skills-syncer.json`.
+
 ## The source catalog
 
 A source is just a directory — a `github:owner/repo[#ref]` (shallow-cloned) or a

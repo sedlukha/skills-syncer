@@ -5,6 +5,7 @@
 //   npx skills-syncer --from github:acme/our-skills --skill '*'
 //   npx skills-syncer --from ./local-catalog --skill fsd-rules react-rules
 //   npx skills-syncer --from github:acme/our-skills --skill run-maintain --agent worker
+//   npx skills-syncer --from ./local-catalog --skill '*' --dry-run  # preview only
 //   npx skills-syncer                              # re-sync using ./skills-syncer.json
 //
 // It copies REAL files (not symlinks) into the current repo:
@@ -36,7 +37,8 @@ import {
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
-import { join, resolve, relative, basename } from 'node:path'
+import { join, resolve, relative, basename, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const cwd = process.cwd()
 
@@ -57,7 +59,8 @@ const SHARED_END = '<!-- end shared. Put repo-specific notes below this line. --
 
 // --- tiny CLI parser --------------------------------------------------------
 // `--from X` takes one value; `--skill a b c` / `--agent a b c` take a list
-// that runs until the next `--flag`. Each list accepts '*'.
+// that runs until the next flag (a token starting with `-`, long or short).
+// Each list accepts '*'. Skill/agent names never start with a dash.
 /** @param {string[]} argv @param {string} flag @returns {string | null} */
 function parseValueArg(argv, flag) {
   const i = argv.indexOf(flag)
@@ -69,7 +72,7 @@ function parseListArg(argv, flag) {
   if (i === -1) return null
   const out = []
   for (let j = i + 1; j < argv.length; j++) {
-    if (argv[j].startsWith('--')) break
+    if (argv[j].startsWith('-')) break
     out.push(argv[j])
   }
   return out
@@ -168,10 +171,45 @@ function fail(msg) {
   throw new SyncError(msg)
 }
 
+/** @returns {string} */
+function readVersion() {
+  const pkg = readJson(join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'))
+  return (pkg && pkg.version) || '0.0.0'
+}
+
+const HELP = `skills-syncer — vendor Claude Code skills + agents from a catalog into your repo
+
+Usage:
+  skills-syncer --from <src> --skill <names…> [--agent <names…>]
+  skills-syncer                      re-sync using ./skills-syncer.json
+
+Options:
+  --from <src>      catalog source: github:owner/repo[#ref] or a local path
+  --skill <names…>  skills to install ('*' = all in the catalog)
+  --agent <names…>  agents to install directly ('*' = all); agents required
+                    by a selected skill are pulled automatically
+  --dry-run, -n     show what would change; write nothing
+  --help, -h        show this help
+  --version, -v     print the version
+
+Writes .claude/skills/, .claude/agents/, AGENTS.md, skills-syncer.json and
+skills-syncer-lock.json into the current repo. Commit the result.`
+
+const topArgv = process.argv.slice(2)
+if (topArgv.includes('--help') || topArgv.includes('-h')) {
+  console.log(HELP)
+  process.exit(0)
+}
+if (topArgv.includes('--version') || topArgv.includes('-v')) {
+  console.log(readVersion())
+  process.exit(0)
+}
+
 // --- resolve source + selection ---------------------------------------------
 let cleanup = () => {}
 try {
   const argv = process.argv.slice(2)
+  const dryRun = argv.includes('--dry-run') || argv.includes('-n')
   const config = readJson(join(cwd, 'skills-syncer.json')) || {}
 
   const from = parseValueArg(argv, '--from') || config.from
@@ -262,15 +300,17 @@ try {
     }
     // Our own copy, edited locally since last sync: about to be overwritten.
     if (prev && existsSync(dest) && dirHash(dest) !== prev.hash) {
-      console.warn(`[skills-syncer] skill "${name}" was edited locally since last sync — overwriting. Make the change in the source catalog instead.`)
+      console.warn(`[skills-syncer] skill "${name}" was edited locally since last sync — ${dryRun ? 'would overwrite' : 'overwriting'}. Make the change in the source catalog instead.`)
     }
-    rmSync(dest, { recursive: true, force: true })
-    mkdirSync(dest, { recursive: true })
-    cpSync(src, dest, { recursive: true })
+    if (!dryRun) {
+      rmSync(dest, { recursive: true, force: true })
+      mkdirSync(dest, { recursive: true })
+      cpSync(src, dest, { recursive: true })
+    }
     lock.skills[name] = { hash: dirHash(src) }
   }
 
-  if (agentsToInstall.size) mkdirSync(agentsDest, { recursive: true })
+  if (agentsToInstall.size && !dryRun) mkdirSync(agentsDest, { recursive: true })
   for (const role of [...agentsToInstall].sort()) {
     const src = join(srcAgentsDir, `${role}.md`)
     const dest = join(agentsDest, `${role}.md`)
@@ -280,10 +320,12 @@ try {
       continue
     }
     if (prev && existsSync(dest) && fileHash(dest) !== prev.hash) {
-      console.warn(`[skills-syncer] agent "${role}" was edited locally since last sync — overwriting. Make the change in the source catalog instead.`)
+      console.warn(`[skills-syncer] agent "${role}" was edited locally since last sync — ${dryRun ? 'would overwrite' : 'overwriting'}. Make the change in the source catalog instead.`)
     }
-    rmSync(dest, { force: true })
-    cpSync(src, dest)
+    if (!dryRun) {
+      rmSync(dest, { force: true })
+      cpSync(src, dest)
+    }
     lock.agents[role] = {
       hash: fileHash(src),
       explicit: explicitAgents.has(role),
@@ -298,7 +340,7 @@ try {
     if (lock.skills[name]) continue
     const dest = join(skillsDest, name)
     if (existsSync(dest)) {
-      rmSync(dest, { recursive: true, force: true })
+      if (!dryRun) rmSync(dest, { recursive: true, force: true })
       removed.skills.push(name)
     }
   }
@@ -307,33 +349,38 @@ try {
     if (lock.agents[role]) continue
     const dest = join(agentsDest, `${role}.md`)
     if (existsSync(dest)) {
-      rmSync(dest, { force: true })
+      if (!dryRun) rmSync(dest, { force: true })
       removed.agents.push(role)
     }
   }
 
   // --- shared AGENTS.md block -----------------------------------------------
-  const wroteAgentsMd = syncAgentsMd(srcAgentsMd)
+  const wroteAgentsMd = syncAgentsMd(srcAgentsMd, dryRun)
 
   // --- persist config + lock ------------------------------------------------
-  writeFileSync(
-    join(cwd, 'skills-syncer.json'),
-    `${JSON.stringify({ from, skills: skillLiteral, agents: agentLiteral }, null, 2)}\n`,
-  )
-  writeFileSync(join(cwd, 'skills-syncer-lock.json'), `${JSON.stringify(lock, null, 2)}\n`)
+  if (!dryRun) {
+    writeFileSync(
+      join(cwd, 'skills-syncer.json'),
+      `${JSON.stringify({ from, skills: skillLiteral, agents: agentLiteral }, null, 2)}\n`,
+    )
+    writeFileSync(join(cwd, 'skills-syncer-lock.json'), `${JSON.stringify(lock, null, 2)}\n`)
+  }
 
   // --- report ---------------------------------------------------------------
   const repo = basename(cwd)
   const nSkills = Object.keys(lock.skills).length
   const nAgents = Object.keys(lock.agents).length
+  const verb = dryRun ? 'would sync' : 'synced'
   console.log(
-    `[skills-syncer] synced ${nSkills} skill(s)` +
+    `[skills-syncer]${dryRun ? ' (dry-run)' : ''} ${verb} ${nSkills} skill(s)` +
       (nAgents ? ` + ${nAgents} agent(s)` : '') +
       (wroteAgentsMd ? ' + AGENTS.md' : '') +
       ` into ${repo} (from ${from})`,
   )
-  if (removed.skills.length) console.log(`[skills-syncer] removed skills: ${removed.skills.join(', ')}`)
-  if (removed.agents.length) console.log(`[skills-syncer] removed agents: ${removed.agents.join(', ')}`)
+  const rverb = dryRun ? 'would remove' : 'removed'
+  if (removed.skills.length) console.log(`[skills-syncer] ${rverb} skills: ${removed.skills.join(', ')}`)
+  if (removed.agents.length) console.log(`[skills-syncer] ${rverb} agents: ${removed.agents.join(', ')}`)
+  if (dryRun) console.log('[skills-syncer] dry run — nothing written. Re-run without --dry-run to apply.')
 } catch (err) {
   if (err instanceof SyncError) {
     console.error(`[skills-syncer] ${err.message}`)
@@ -347,8 +394,8 @@ try {
 
 // Put the shared block at the top of the repo's AGENTS.md, keeping repo-specific
 // notes below it. Idempotent: re-running replaces only the fenced block.
-/** @param {string} srcAgentsMd @returns {boolean} */
-function syncAgentsMd(srcAgentsMd) {
+/** @param {string} srcAgentsMd @param {boolean} dryRun @returns {boolean} */
+function syncAgentsMd(srcAgentsMd, dryRun) {
   if (!existsSync(srcAgentsMd)) return false
   const shared = readFileSync(srcAgentsMd, 'utf8').trim()
   const block = `${SHARED_BEGIN}\n\n${shared}\n\n${SHARED_END}`
@@ -371,6 +418,6 @@ function syncAgentsMd(srcAgentsMd) {
     }
   }
   if (!body.endsWith('\n')) body += '\n'
-  writeFileSync(dest, body)
+  if (!dryRun) writeFileSync(dest, body)
   return true
 }
