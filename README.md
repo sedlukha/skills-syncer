@@ -143,6 +143,26 @@ local path — laid out like this:
   fenced markers; repo-specific notes below the block are preserved across
   re-syncs.
 
+### Bundled catalog (ship the tool with your catalog)
+
+A catalog repo can **bundle** skills-syncer as its own `bin`, so consumers run it
+straight from the catalog with no `--from`:
+
+```jsonc
+// package.json in your catalog repo
+{ "bin": { "your-catalog": "bin/skills-syncer.mjs" } }
+```
+
+```bash
+npx github:acme/our-skills --skill '*'   # the catalog is its own source
+```
+
+When no `--from` is given and there is no `skills-syncer.json`, the tool falls
+back to its own package root if that carries a catalog (`skills/`,
+`.claude/skills/`, …). The lock records the catalog's package name as the source,
+and `skills-syncer.json` keeps only the selection (a bare re-sync resolves the
+bundled catalog again).
+
 ## What it writes into your repo
 
 | File | Role |

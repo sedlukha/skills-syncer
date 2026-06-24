@@ -177,6 +177,24 @@ function readVersion() {
   return (pkg && pkg.version) || '0.0.0'
 }
 
+// A catalog can *bundle* this tool: ship skills-syncer as its own `bin` so
+// consumers run `npx github:owner/catalog --skill X` with no --from. When no
+// source is given on the CLI or in skills-syncer.json, fall back to this tool's
+// own package root if it carries a catalog.
+/** @returns {string | null} the bundling package root, or null */
+function bundledCatalogRoot() {
+  const pkgRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
+  const hasCatalog = ['skills', '.claude/skills', 'agents', '.claude/agents'].some((p) =>
+    existsSync(join(pkgRoot, ...p.split('/'))),
+  )
+  return hasCatalog ? pkgRoot : null
+}
+/** @param {string} pkgRoot @returns {string | null} */
+function bundledName(pkgRoot) {
+  const pkg = readJson(join(pkgRoot, 'package.json'))
+  return (pkg && pkg.name) || null
+}
+
 const HELP = `skills-syncer — vendor Claude Code skills + agents from a catalog into your repo
 
 Usage:
@@ -213,11 +231,22 @@ try {
   const config = readJson(join(cwd, 'skills-syncer.json')) || {}
 
   const from = parseValueArg(argv, '--from') || config.from
-  if (!from) {
-    fail('no source. pass --from <github:owner/repo | ./path>, or add it to skills-syncer.json.')
+  let bundled = false
+  /** @type {string} the human label for the source, recorded in the lock */
+  let sourceId
+  let src
+  if (from) {
+    src = resolveSource(from)
+    sourceId = from
+  } else {
+    const cat = bundledCatalogRoot()
+    if (!cat) {
+      fail('no source. pass --from <github:owner/repo | ./path>, or add it to skills-syncer.json.')
+    }
+    bundled = true
+    src = { root: cat, cleanup: () => {} }
+    sourceId = bundledName(cat) || 'bundled-catalog'
   }
-
-  const src = resolveSource(from)
   const root = src.root
   cleanup = src.cleanup
 
@@ -286,7 +315,7 @@ try {
   /** @type {Lock | null} */
   const prevLock = readJson(join(cwd, 'skills-syncer-lock.json'))
   /** @type {Lock} */
-  const lock = { version: 1, source: from, skills: {}, agents: {} }
+  const lock = { version: 1, source: sourceId, skills: {}, agents: {} }
 
   for (const name of [...skillSel].sort()) {
     const src = join(srcSkillsDir, name)
@@ -358,11 +387,14 @@ try {
   const wroteAgentsMd = syncAgentsMd(srcAgentsMd, dryRun)
 
   // --- persist config + lock ------------------------------------------------
+  // A bundled catalog has no stable `from` to record (the path is an ephemeral
+  // npx checkout), so the intent file keeps only the selection — a bare re-sync
+  // falls back to the bundled catalog again.
   if (!dryRun) {
-    writeFileSync(
-      join(cwd, 'skills-syncer.json'),
-      `${JSON.stringify({ from, skills: skillLiteral, agents: agentLiteral }, null, 2)}\n`,
-    )
+    const intent = bundled
+      ? { skills: skillLiteral, agents: agentLiteral }
+      : { from, skills: skillLiteral, agents: agentLiteral }
+    writeFileSync(join(cwd, 'skills-syncer.json'), `${JSON.stringify(intent, null, 2)}\n`)
     writeFileSync(join(cwd, 'skills-syncer-lock.json'), `${JSON.stringify(lock, null, 2)}\n`)
   }
 
@@ -375,7 +407,7 @@ try {
     `[skills-syncer]${dryRun ? ' (dry-run)' : ''} ${verb} ${nSkills} skill(s)` +
       (nAgents ? ` + ${nAgents} agent(s)` : '') +
       (wroteAgentsMd ? ' + AGENTS.md' : '') +
-      ` into ${repo} (from ${from})`,
+      ` into ${repo} (from ${sourceId})`,
   )
   const rverb = dryRun ? 'would remove' : 'removed'
   if (removed.skills.length) console.log(`[skills-syncer] ${rverb} skills: ${removed.skills.join(', ')}`)
@@ -412,6 +444,10 @@ function syncAgentsMd(srcAgentsMd, dryRun) {
       body = cur.slice(0, b) + block + cur.slice(e + SHARED_END.length)
     } else {
       let rest = cur.trimStart()
+      // Migrate a block fenced by DIFFERENT markers (e.g. an older tool's): if the
+      // file opens with an HTML-comment fence wrapping exactly the shared text,
+      // drop the whole fenced block so the new one does not duplicate it.
+      rest = stripForeignFence(rest, shared)
       if (rest.startsWith(shared)) rest = rest.slice(shared.length)
       rest = rest.replace(/^\s+/, '')
       body = rest ? `${block}\n\n${rest}` : block
@@ -420,4 +456,20 @@ function syncAgentsMd(srcAgentsMd, dryRun) {
   if (!body.endsWith('\n')) body += '\n'
   if (!dryRun) writeFileSync(dest, body)
   return true
+}
+
+// If `text` opens with `<!-- … -->\n\n<shared>\n\n<!-- … -->` (any marker text),
+// return it with that fenced block removed; otherwise return `text` unchanged.
+// Lets us adopt a repo previously fenced by a different tool without duplicating.
+/** @param {string} text @param {string} shared @returns {string} */
+function stripForeignFence(text, shared) {
+  if (!text.startsWith('<!--')) return text
+  const open = text.indexOf('-->')
+  if (open === -1) return text
+  const inner = text.slice(open + 3).trimStart()
+  if (!inner.startsWith(shared)) return text
+  const afterShared = inner.slice(shared.length).trimStart()
+  if (!afterShared.startsWith('<!--')) return text
+  const close = afterShared.indexOf('-->')
+  return close === -1 ? text : afterShared.slice(close + 3)
 }

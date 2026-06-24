@@ -14,6 +14,7 @@ import {
   mkdirSync,
   writeFileSync,
   readFileSync,
+  copyFileSync,
   existsSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -48,12 +49,13 @@ before(() => {
 function newRepo() {
   return mkdtempSync(join(tmpdir(), 'sst-repo-'))
 }
-/** @param {string} repo @param {string[]} [args] @param {object} [opts] */
+/** @param {string} repo @param {string[]} [args] @param {Record<string, any>} [opts] */
 function run(repo, args = [], opts = {}) {
-  const res = spawnSync(process.execPath, [BIN, ...args], {
+  const { _bin = BIN, ...spawnOpts } = opts
+  const res = spawnSync(process.execPath, [_bin, ...args], {
     cwd: repo,
     encoding: 'utf8',
-    ...opts,
+    ...spawnOpts,
   })
   return { status: res.status, stdout: res.stdout || '', stderr: res.stderr || '' }
 }
@@ -220,4 +222,57 @@ test('--dry-run previews removals without deleting', () => {
   assert.ok(has(repo, '.claude', 'skills', 'review-flow'), 'dropped skill untouched')
   // and the lock still records it
   assert.ok(lock(repo).skills['review-flow'])
+})
+
+// Build a "package" that bundles skills-syncer as its own bin and ships a
+// catalog beside it — the `npx github:owner/catalog` shape.
+function newBundledCatalog() {
+  const pkg = mkdtempSync(join(tmpdir(), 'sst-bundle-'))
+  mkdirSync(join(pkg, 'bin'), { recursive: true })
+  copyFileSync(BIN, join(pkg, 'bin', 'skills-syncer.mjs'))
+  writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'cat-pkg', version: '9.9.9' }))
+  mkdirSync(join(pkg, '.claude', 'skills', 'foo'), { recursive: true })
+  writeFileSync(join(pkg, '.claude', 'skills', 'foo', 'SKILL.md'), 'FOO\n')
+  mkdirSync(join(pkg, '.claude', 'agents'), { recursive: true })
+  writeFileSync(join(pkg, '.claude', 'agents', 'bar.md'), 'BAR\n')
+  writeFileSync(join(pkg, 'skill-agents.json'), JSON.stringify({ foo: ['bar'] }))
+  writeFileSync(join(pkg, 'AGENTS.md'), '# Shared\n\nBe nice.\n')
+  return join(pkg, 'bin', 'skills-syncer.mjs')
+}
+
+test('a bundled catalog is used as the source when no --from is given', () => {
+  const bin = newBundledCatalog()
+  const repo = newRepo()
+  const r = run(repo, ['--skill', 'foo'], { _bin: bin })
+  assert.equal(r.status, 0, r.stderr)
+  assert.ok(has(repo, '.claude', 'skills', 'foo', 'SKILL.md'))
+  assert.ok(has(repo, '.claude', 'agents', 'bar.md'), 'manifest-required agent pulled')
+  assert.ok(has(repo, 'AGENTS.md'), 'shared block written')
+  // intent file records the selection but no ephemeral `from` path
+  assert.deepEqual(config(repo), { skills: ['foo'], agents: [] })
+  assert.equal(lock(repo).source, 'cat-pkg', 'lock records the package name')
+  // a bare re-sync still resolves the bundled catalog from the selection
+  const r2 = run(repo, [], { _bin: bin })
+  assert.equal(r2.status, 0, r2.stderr)
+  assert.ok(has(repo, '.claude', 'skills', 'foo', 'SKILL.md'))
+})
+
+test('adopting over a different tool’s fenced block does not duplicate it', () => {
+  const repo = newRepo()
+  // a repo previously managed by another tool: its own markers around the shared
+  // text, with repo notes below
+  const shared = readFileSync(join(CATALOG, 'AGENTS.md'), 'utf8').trim()
+  const old =
+    `<!-- OLD TOOL begin -->\n\n${shared}\n\n<!-- OLD TOOL end -->\n\n## Repo note\n\nKeep me.\n`
+  // install something so AGENTS.md is synced
+  mkdirSync(join(repo, '.claude'), { recursive: true })
+  writeFileSync(join(repo, 'AGENTS.md'), old)
+
+  const r = run(repo, ['--from', CATALOG, '--skill', 'hello-rules'])
+  assert.equal(r.status, 0, r.stderr)
+  const md = read(repo, 'AGENTS.md')
+  assert.equal(occurrences(md, 'managed by skills-syncer'), 1, 'one managed block')
+  assert.equal(occurrences(md, 'OLD TOOL'), 0, 'old fence removed')
+  assert.equal(occurrences(md, 'Use plain English'), 1, 'shared text not duplicated')
+  assert.match(md, /Keep me\./, 'repo note preserved')
 })
