@@ -1,5 +1,7 @@
 # skills-syncer
 
+[![CI](https://github.com/sedlukha/skills-syncer/actions/workflows/ci.yml/badge.svg)](https://github.com/sedlukha/skills-syncer/actions/workflows/ci.yml)
+
 Vendor [Claude Code](https://docs.claude.com/claude-code) **skills** and the
 **subagents** they use from one catalog into many repos — real file copies,
 recorded by a lockfile. One source of truth instead of a copy you hand-edit
