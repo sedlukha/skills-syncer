@@ -27,6 +27,9 @@
   "bin": {
     "skills-syncer": "bin/skills-syncer.mjs"
   },
+  "scripts": {
+    "test": "node --test"
+  },
   "files": [
     "bin",
     "README.md",

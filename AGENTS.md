@@ -46,8 +46,20 @@ script itself, run via `npx skills-syncer`.
 
 ## Verifying a change
 
-There is no test runner yet. Verify by running the script against a real catalog
-into a throwaway directory and inspecting the result:
+Run the test suite — it uses only Node's built-in runner, so no install is
+needed:
+
+```bash
+node --test        # or: npm test
+```
+
+Tests live in `test/` and drive the real CLI as a child process against a
+throwaway catalog fixture. They cover: selection installed, manifest-required
+agents pulled, cleanup on a narrowed selection, repo-authored files never
+clobbered, locally-edited copies overwritten with a warning, and `AGENTS.md`
+merged with a single shared block. Add a case here when you change behaviour.
+
+For a quick manual smoke test against a real catalog:
 
 ```bash
 T=$(mktemp -d) && cd "$T"
@@ -55,7 +67,3 @@ node /path/to/skills-syncer/bin/skills-syncer.mjs --from <catalog> --skill '*'
 find .claude -maxdepth 2 | sort
 cat skills-syncer.json skills-syncer-lock.json
 ```
-
-Always check: selection installed, manifest-required agents pulled, cleanup on a
-narrowed selection, `AGENTS.md` merged with a single shared block, and no
-`skills-syncer-*` temp dirs left in `$TMPDIR` after an error path.
