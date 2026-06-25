@@ -24,6 +24,10 @@ from `--from`:
 npx skills-syncer --from github:acme/our-skills --skill fsd-rules react-rules
 ```
 
+```text
+✓ synced 2 skills · 1 agent · AGENTS.md → my-repo  (github:acme/our-skills)
+```
+
 Then **commit** what it wrote: `.claude/skills/`, `.claude/agents/` (if any),
 `AGENTS.md`, `skills-syncer.json`, and `skills-syncer-lock.json`.
 
@@ -113,6 +117,26 @@ It walks one level deep (worktrees and nested repos are not reached) and reports
 how many repos synced, were skipped (no `skills-syncer.json`), or failed. Repos
 that share a source are grouped, so a `github:` catalog is **fetched once**, not
 once per repo, and a repo whose source fails doesn't stop the rest.
+
+The output is one aligned line per repo — the source is printed once per group,
+not on every line — with a summary at the end (colours show on a terminal, plain
+when piped or under `NO_COLOR`):
+
+```text
+skills-syncer · syncing 4 repo(s)  (1 skipped — no skills-syncer.json)
+  from github:acme/our-skills
+    ✓ api-core     2 skills · AGENTS.md
+    ✓ ui-kit      22 skills · 6 agents · AGENTS.md
+    ✓ web-app     36 skills · 6 agents · AGENTS.md
+    ✓ checkout     1 skill · AGENTS.md  −3 removed
+  from github:acme/legacy-skills
+    ✗ old-portal  could not clone https://github.com/acme/legacy-skills.git
+
+done with errors · synced 4 repo(s), skipped 1 (no skills-syncer.json), failed: old-portal
+```
+
+A removed count (`−3 removed`) appears when a re-sync drops items no longer in
+the repo's selection.
 
 Every sync is **incremental**: an item already matching the catalog is left
 untouched, so a re-sync with nothing to do is a true no-op (no file churn).

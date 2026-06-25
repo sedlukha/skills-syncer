@@ -63,6 +63,36 @@ import { fileURLToPath } from 'node:url'
 const SHARED_BEGIN = '<!-- shared — managed by skills-syncer. Edit it in the source catalog, not here. -->'
 const SHARED_END = '<!-- end shared. Put repo-specific notes below this line. -->'
 
+// --- tiny ANSI styling (zero deps) ------------------------------------------
+// Honour NO_COLOR and only colour a real terminal; piping/CI stays plain so the
+// output is greppable. Kept inline so the tool ships as a single file.
+const COLOR = !!process.stdout.isTTY && !process.env.NO_COLOR && process.env.TERM !== 'dumb'
+/** @param {string} code @returns {(s: string | number) => string} */
+const sgr = (code) => (s) => (COLOR ? `\x1b[${code}m${s}\x1b[0m` : `${s}`)
+const c = {
+  bold: sgr('1'),
+  dim: sgr('2'),
+  red: sgr('31'),
+  green: sgr('32'),
+  yellow: sgr('33'),
+  cyan: sgr('36'),
+}
+const SYM = { ok: COLOR ? '✓' : 'OK', fail: COLOR ? '✗' : 'XX', skip: COLOR ? '·' : '-' }
+
+// Human-readable summary of what a sync touched: "36 skills · 6 agents · AGENTS.md".
+/** @param {{ nSkills: number, nAgents: number, wroteAgentsMd: boolean,
+ *            removed: { skills: string[], agents: string[] } }} r @returns {string} */
+function describe(r) {
+  const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`
+  const parts = [plural(r.nSkills, 'skill')]
+  if (r.nAgents) parts.push(plural(r.nAgents, 'agent'))
+  if (r.wroteAgentsMd) parts.push('AGENTS.md')
+  let out = parts.join(c.dim(' · '))
+  const nRemoved = r.removed.skills.length + r.removed.agents.length
+  if (nRemoved) out += `  ${c.yellow(`−${nRemoved} removed`)}`
+  return out
+}
+
 // --- tiny CLI parser --------------------------------------------------------
 // `--from X` takes one value; `--skill a b c` / `--agent a b c` take a list
 // that runs until the next flag (a token starting with `-`, long or short).
@@ -254,12 +284,15 @@ function bundledName(pkgRoot) {
 // `catalog` may be pre-resolved (the caller then owns its cleanup) — `--all`
 // uses this to fetch a shared source once and reuse it across repos.
 /**
+ * @typedef {{ repoName: string, nSkills: number, nAgents: number,
+ *             wroteAgentsMd: boolean, sourceId: string,
+ *             removed: { skills: string[], agents: string[] } }} SyncResult
  * @param {{ cwd: string, from?: string, skills: string[], agents: string[],
- *           dryRun: boolean, catalog?: Catalog }} o
- * @returns {void}
+ *           dryRun: boolean, catalog?: Catalog, quiet?: boolean }} o
+ * @returns {SyncResult}
  */
 function sync(o) {
-  const { cwd, skills, agents, dryRun } = o
+  const { cwd, skills, agents, dryRun, quiet } = o
   const cat = o.catalog || resolveCatalog(o.from)
   try {
     const root = cat.root
@@ -398,20 +431,29 @@ function sync(o) {
     }
 
     // --- report ---------------------------------------------------------------
-    const repoName = basename(cwd)
-    const nSkills = Object.keys(lock.skills).length
-    const nAgents = Object.keys(lock.agents).length
-    const verb = dryRun ? 'would sync' : 'synced'
-    console.log(
-      `[skills-syncer]${dryRun ? ' (dry-run)' : ''} ${verb} ${nSkills} skill(s)` +
-        (nAgents ? ` + ${nAgents} agent(s)` : '') +
-        (wroteAgentsMd ? ' + AGENTS.md' : '') +
-        ` into ${repoName} (from ${cat.sourceId})`,
-    )
-    const rverb = dryRun ? 'would remove' : 'removed'
-    if (removed.skills.length) console.log(`[skills-syncer] ${rverb} skills: ${removed.skills.join(', ')}`)
-    if (removed.agents.length) console.log(`[skills-syncer] ${rverb} agents: ${removed.agents.join(', ')}`)
-    if (dryRun) console.log('[skills-syncer] dry run — nothing written. Re-run without --dry-run to apply.')
+    /** @type {SyncResult} */
+    const result = {
+      repoName: basename(cwd),
+      nSkills: Object.keys(lock.skills).length,
+      nAgents: Object.keys(lock.agents).length,
+      wroteAgentsMd,
+      sourceId: cat.sourceId,
+      removed,
+    }
+    // In --all (quiet) the caller prints an aligned line per repo; standalone we
+    // print our own block here.
+    if (!quiet) {
+      const verb = dryRun ? `${c.dim('(dry-run)')} would sync` : c.green('synced')
+      console.log(
+        `${dryRun ? c.dim(SYM.skip) : c.green(SYM.ok)} ${verb} ${describe(result)} ` +
+          `${c.dim('→')} ${c.bold(result.repoName)}  ${c.dim(`(${cat.sourceId})`)}`,
+      )
+      const rverb = dryRun ? 'would remove' : 'removed'
+      if (removed.skills.length) console.log(`  ${c.yellow(`${rverb} skills:`)} ${removed.skills.join(', ')}`)
+      if (removed.agents.length) console.log(`  ${c.yellow(`${rverb} agents:`)} ${removed.agents.join(', ')}`)
+      if (dryRun) console.log(c.dim('dry run — nothing written. Re-run without --dry-run to apply.'))
+    }
+    return result
   } finally {
     if (!o.catalog) cat.cleanup()
   }
@@ -438,13 +480,24 @@ function runAll(o) {
     groups.get(key)?.repos.push(name)
   }
 
+  // Width the repo column to the longest name so the descriptions line up.
+  const pad = repos.reduce((w, n) => Math.max(w, n.length), 0)
+  const multiSource = groups.size > 1
+  console.log(
+    `\n${c.bold('skills-syncer')} ${c.dim('·')} ${dryRun ? 'previewing' : 'syncing'} ` +
+      `${c.bold(repos.length)} repo(s)` +
+      (skipped ? c.dim(`  (${skipped} skipped — no skills-syncer.json)`) : ''),
+  )
+
   /** @type {string[]} */ const ok = []
   /** @type {string[]} */ const failed = []
   for (const grp of groups.values()) {
+    // Source line once per group, not once per repo (the old noise).
+    console.log(`${c.dim('  from')} ${c.cyan(grp.from || '<bundled>')}`)
     const catalog = tryResolve(grp.from)
     if (!catalog) {
       for (const name of grp.repos) {
-        console.error(`[skills-syncer] --all ✗ ${name}: source could not be resolved`)
+        console.log(`    ${c.red(SYM.fail)} ${name.padEnd(pad)}  ${c.red('source could not be resolved')}`)
         failed.push(name)
       }
       continue
@@ -453,13 +506,16 @@ function runAll(o) {
       for (const name of grp.repos) {
         /** @type {Config} */
         const cfg = readJson(join(root, name, 'skills-syncer.json')) || {}
-        console.log(`[skills-syncer] --all → ${name}`)
         try {
-          sync({ cwd: join(root, name), from: grp.from, skills: cfg.skills || [], agents: cfg.agents || [], dryRun, catalog })
+          const r = sync({
+            cwd: join(root, name), from: grp.from,
+            skills: cfg.skills || [], agents: cfg.agents || [], dryRun, catalog, quiet: true,
+          })
+          console.log(`    ${c.green(SYM.ok)} ${c.bold(name.padEnd(pad))}  ${describe(r)}`)
           ok.push(name)
         } catch (err) {
           if (!(err instanceof SyncError)) throw err
-          console.error(`[skills-syncer] ${err.message}`)
+          console.log(`    ${c.red(SYM.fail)} ${c.bold(name.padEnd(pad))}  ${c.red(err.message)}`)
           failed.push(name)
         }
       }
@@ -468,10 +524,12 @@ function runAll(o) {
     }
   }
 
+  // Summary: keep the machine-greppable "synced N repo(s), skipped M" wording.
+  const head = failed.length ? c.yellow('done with errors') : c.green('done')
   console.log(
-    `[skills-syncer] --all: ${dryRun ? 'previewed' : 'synced'} ${ok.length} repo(s)` +
+    `\n${head} ${c.dim('·')} ${dryRun ? 'previewed' : 'synced'} ${c.bold(ok.length)} repo(s)` +
       `, skipped ${skipped} (no skills-syncer.json)` +
-      (failed.length ? `, failed: ${failed.join(', ')}` : ''),
+      (failed.length ? c.red(`, failed: ${failed.join(', ')}`) : ''),
   )
   return failed.length ? 1 : 0
 }
