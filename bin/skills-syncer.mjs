@@ -507,11 +507,12 @@ function syncAgentsMd(cwd, srcAgentsMd, dryRun) {
     if (b !== -1 && e !== -1) {
       body = cur.slice(0, b) + block + cur.slice(e + SHARED_END.length)
     } else {
+      // First merge into a repo-authored AGENTS.md: drop a leading raw copy of
+      // the shared text if present (so we don't duplicate it) and keep the rest
+      // below our block. A block fenced by ANOTHER tool's markers is left as-is —
+      // migrating off that tool means removing its block first (a one-time,
+      // tool-specific step, not something this generic merge should guess at).
       let rest = cur.trimStart()
-      // Migrate a block fenced by DIFFERENT markers (e.g. an older tool's): if the
-      // file opens with an HTML-comment fence wrapping exactly the shared text,
-      // drop the whole fenced block so the new one does not duplicate it.
-      rest = stripForeignFence(rest, shared)
       if (rest.startsWith(shared)) rest = rest.slice(shared.length)
       rest = rest.replace(/^\s+/, '')
       body = rest ? `${block}\n\n${rest}` : block
@@ -520,22 +521,6 @@ function syncAgentsMd(cwd, srcAgentsMd, dryRun) {
   if (!body.endsWith('\n')) body += '\n'
   if (!dryRun && (!existsSync(dest) || readFileSync(dest, 'utf8') !== body)) writeFileSync(dest, body)
   return true
-}
-
-// If `text` opens with `<!-- … -->\n\n<shared>\n\n<!-- … -->` (any marker text),
-// return it with that fenced block removed; otherwise return `text` unchanged.
-// Lets us adopt a repo previously fenced by a different tool without duplicating.
-/** @param {string} text @param {string} shared @returns {string} */
-function stripForeignFence(text, shared) {
-  if (!text.startsWith('<!--')) return text
-  const open = text.indexOf('-->')
-  if (open === -1) return text
-  const inner = text.slice(open + 3).trimStart()
-  if (!inner.startsWith(shared)) return text
-  const afterShared = inner.slice(shared.length).trimStart()
-  if (!afterShared.startsWith('<!--')) return text
-  const close = afterShared.indexOf('-->')
-  return close === -1 ? text : afterShared.slice(close + 3)
 }
 
 // --- CLI entry --------------------------------------------------------------
@@ -561,20 +546,58 @@ Options:
 Writes .claude/skills/, .claude/agents/, AGENTS.md, skills-syncer.json and
 skills-syncer-lock.json into the current repo. Commit the result.`
 
+const VALUE_FLAGS = new Set(['--from', '--root']) // take exactly one value
+const LIST_FLAGS = new Set(['--skill', '--agent']) // take a list until the next flag
+const KNOWN_FLAGS = new Set([
+  ...VALUE_FLAGS,
+  ...LIST_FLAGS,
+  '--all',
+  '--dry-run',
+  '-n',
+  '--help',
+  '-h',
+  '--version',
+  '-v',
+])
+
+// Reject unknown flags, stray positionals, and a value flag with no value — so a
+// typo fails loudly instead of being silently ignored.
+/** @param {string[]} argv @returns {void} */
+function validateArgs(argv) {
+  for (let i = 0; i < argv.length; i++) {
+    const tok = argv[i]
+    if (!tok.startsWith('-')) fail(`unexpected argument "${tok}". Run --help for usage.`)
+    if (!KNOWN_FLAGS.has(tok)) fail(`unknown flag "${tok}". Run --help for usage.`)
+    if (VALUE_FLAGS.has(tok)) {
+      if (i + 1 >= argv.length || argv[i + 1].startsWith('-')) fail(`"${tok}" expects a value`)
+      i++ // consume the value
+    } else if (LIST_FLAGS.has(tok)) {
+      while (i + 1 < argv.length && !argv[i + 1].startsWith('-')) i++ // consume the list
+    }
+  }
+}
+
 function main() {
   const argv = process.argv.slice(2)
   if (argv.includes('--help') || argv.includes('-h')) return console.log(HELP)
   if (argv.includes('--version') || argv.includes('-v')) return console.log(readVersion())
 
-  const dryRun = argv.includes('--dry-run') || argv.includes('-n')
-
-  if (argv.includes('--all')) {
-    const rootArg = parseValueArg(argv, '--root')
-    process.exitCode = runAll({ root: rootArg ? resolve(rootArg) : process.cwd(), dryRun })
-    return
-  }
-
   try {
+    validateArgs(argv)
+    const dryRun = argv.includes('--dry-run') || argv.includes('-n')
+
+    if (argv.includes('--all')) {
+      for (const f of ['--from', '--skill', '--agent'])
+        if (argv.includes(f))
+          console.warn(`[skills-syncer] --all ignores ${f}: each repo re-syncs from its own skills-syncer.json`)
+      const rootArg = parseValueArg(argv, '--root')
+      const root = rootArg ? resolve(rootArg) : process.cwd()
+      if (!existsSync(root)) fail(`--root path does not exist: ${root}`)
+      process.exitCode = runAll({ root, dryRun })
+      return
+    }
+    if (argv.includes('--root')) console.warn('[skills-syncer] --root has no effect without --all')
+
     const cwd = process.cwd()
     /** @type {Config} */
     const config = readJson(join(cwd, 'skills-syncer.json')) || {}

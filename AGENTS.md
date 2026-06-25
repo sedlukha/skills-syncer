@@ -79,9 +79,10 @@ Tests live in `test/` and drive the real CLI as a child process against a
 throwaway catalog fixture. They cover: selection installed, manifest-required
 agents pulled, cleanup on a narrowed selection, repo-authored files never
 clobbered, locally-edited copies overwritten with a warning, `AGENTS.md` merged
-with a single shared block, an unchanged item skipped on re-sync (no churn), and
-`--all` fleet mode (incl. carrying on past a failed repo). Add a case here when
-you change behaviour.
+with a single shared block, an unchanged item skipped on re-sync (no churn),
+`--all` fleet mode (incl. carrying on past a failed repo), and strict flag
+validation (unknown flag / missing value / stray positional all fail). Add a
+case here when you change behaviour.
 
 For a quick manual smoke test against a real catalog:
 

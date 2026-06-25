@@ -343,22 +343,31 @@ test('--all --dry-run previews each repo without writing', () => {
   assert.ok(!has(repo, '.claude'), 'dry-run wrote nothing')
 })
 
-test('adopting over a different tool’s fenced block does not duplicate it', () => {
-  const repo = newRepo()
-  // a repo previously managed by another tool: its own markers around the shared
-  // text, with repo notes below
-  const shared = readFileSync(join(CATALOG, 'AGENTS.md'), 'utf8').trim()
-  const old =
-    `<!-- OLD TOOL begin -->\n\n${shared}\n\n<!-- OLD TOOL end -->\n\n## Repo note\n\nKeep me.\n`
-  // install something so AGENTS.md is synced
-  mkdirSync(join(repo, '.claude'), { recursive: true })
-  writeFileSync(join(repo, 'AGENTS.md'), old)
+test('an unknown flag fails loudly instead of being ignored', () => {
+  const r = run(newRepo(), ['--from', CATALOG, '--skill', 'hello-rules', '--frobnicate'])
+  assert.equal(r.status, 1)
+  assert.match(r.stderr, /unknown flag "--frobnicate"/)
+})
 
-  const r = run(repo, ['--from', CATALOG, '--skill', 'hello-rules'])
+test('a value flag with no value fails', () => {
+  const r = run(newRepo(), ['--from'])
+  assert.equal(r.status, 1)
+  assert.match(r.stderr, /"--from" expects a value/)
+})
+
+test('a stray positional argument fails', () => {
+  const r = run(newRepo(), ['oops', '--from', CATALOG, '--skill', 'hello-rules'])
+  assert.equal(r.status, 1)
+  assert.match(r.stderr, /unexpected argument "oops"/)
+})
+
+test('--all warns that it ignores --skill, then still runs', () => {
+  const fleet = mkdtempSync(join(tmpdir(), 'sst-fleet-'))
+  const repo = join(fleet, 'r')
+  mkdirSync(repo, { recursive: true })
+  writeFileSync(join(repo, 'skills-syncer.json'), JSON.stringify({ from: CATALOG, skills: ['hello-rules'], agents: [] }))
+  const r = run(fleet, ['--all', '--root', fleet, '--skill', 'x'])
   assert.equal(r.status, 0, r.stderr)
-  const md = read(repo, 'AGENTS.md')
-  assert.equal(occurrences(md, 'managed by skills-syncer'), 1, 'one managed block')
-  assert.equal(occurrences(md, 'OLD TOOL'), 0, 'old fence removed')
-  assert.equal(occurrences(md, 'Use plain English'), 1, 'shared text not duplicated')
-  assert.match(md, /Keep me\./, 'repo note preserved')
+  assert.match(r.stderr, /--all ignores --skill/)
+  assert.ok(has(repo, '.claude', 'skills', 'hello-rules'))
 })
