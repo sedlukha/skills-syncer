@@ -18,6 +18,22 @@ skills-syncer/
 There is no `src/`, no build step, and no `dist/`. The published artifact is the
 script itself, run via `npx skills-syncer`.
 
+## Architecture
+
+The script is organized around one function, `sync(options)`, that vendors a
+catalog into a single repo. The CLI `main()` parses argv and calls it; `--all`'s
+`runAll()` groups sibling repos by their recorded source, resolves each source
+**once**, and calls `sync()` per repo with the shared catalog — so a fleet pull
+fetches a `github:` catalog one time, not once per repo. A pre-resolved catalog
+is passed in via `options.catalog`; the caller then owns its cleanup.
+
+Installs are **incremental and atomic**: per item, the source hash is compared to
+what is on disk and an unchanged item is skipped (no copy); a changed one is
+copied to a `*.skills-syncer-tmp` sibling and renamed into place, so a failed
+copy never destroys an existing folder. `writeJsonStable` does the same for the
+two JSON state files — it skips the write when the parsed data is unchanged, so a
+re-sync stays a clean no-op even if an external formatter reflowed them.
+
 ## Hard rules
 
 - **No runtime dependencies.** The tool uses only Node built-ins (`node:fs`,
@@ -31,9 +47,11 @@ script itself, run via `npx skills-syncer`.
 - **Node ≥ 18.** Only use APIs available there. `git` on PATH is required *only*
   for `github:` sources; local-path sources must work with no external tools.
 - **Idempotent and non-destructive.** A re-sync may only touch what the lockfile
-  installed. Never remove or overwrite a repo-authored skill or agent. Errors
-  must throw `SyncError` (not `process.exit`) so the outer `finally` always runs
-  cleanup — a `github:` source leaves a temp clone that must be removed.
+  installed, and only re-copies an item whose content actually changed. Never
+  remove or overwrite a repo-authored skill or agent. Installs go through a temp
+  sibling + rename so a crash never leaves a half-written folder. Errors must
+  throw `SyncError` (not `process.exit`) so the `finally` in `sync()`/`runAll()`
+  always runs cleanup — a `github:` source leaves a temp clone that must go.
 
 ## Conventions
 
@@ -60,8 +78,10 @@ node --test        # or: npm test
 Tests live in `test/` and drive the real CLI as a child process against a
 throwaway catalog fixture. They cover: selection installed, manifest-required
 agents pulled, cleanup on a narrowed selection, repo-authored files never
-clobbered, locally-edited copies overwritten with a warning, and `AGENTS.md`
-merged with a single shared block. Add a case here when you change behaviour.
+clobbered, locally-edited copies overwritten with a warning, `AGENTS.md` merged
+with a single shared block, an unchanged item skipped on re-sync (no churn), and
+`--all` fleet mode (incl. carrying on past a failed repo). Add a case here when
+you change behaviour.
 
 For a quick manual smoke test against a real catalog:
 

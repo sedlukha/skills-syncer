@@ -110,7 +110,12 @@ npx skills-syncer --all --root ~/code/myorg   # scan a specific folder
 ```
 
 It walks one level deep (worktrees and nested repos are not reached) and reports
-how many repos synced, were skipped (no `skills-syncer.json`), or failed.
+how many repos synced, were skipped (no `skills-syncer.json`), or failed. Repos
+that share a source are grouped, so a `github:` catalog is **fetched once**, not
+once per repo, and a repo whose source fails doesn't stop the rest.
+
+Every sync is **incremental**: an item already matching the catalog is left
+untouched, so a re-sync with nothing to do is a true no-op (no file churn).
 
 ### 9. Preview a sync without writing
 

@@ -7,6 +7,7 @@
 //   npx skills-syncer --from github:acme/our-skills --skill run-maintain --agent worker
 //   npx skills-syncer --from ./local-catalog --skill '*' --dry-run  # preview only
 //   npx skills-syncer                              # re-sync using ./skills-syncer.json
+//   npx skills-syncer --all --root ~/code          # re-sync every repo under a folder
 //
 // It copies REAL files (not symlinks) into the current repo:
 //   ./.claude/skills/<name>/   <- each selected skill folder
@@ -21,6 +22,11 @@
 //   skill-agents.json   (optional) maps a skill -> [agents it needs]
 //   AGENTS.md           (optional) shared Project Instructions block
 //
+// A re-sync is incremental: an item whose content already matches the catalog is
+// left untouched (its on-disk hash equals the source hash). What it does install
+// is written atomically — a copy lands in a temp sibling and is renamed into
+// place, so a failed copy never destroys an existing folder.
+//
 // Commit the result. Files are real copies, so nothing needs this tool at
 // runtime — only the person adding or updating a skill runs the sync.
 
@@ -33,14 +39,13 @@ import {
   readdirSync,
   readFileSync,
   writeFileSync,
+  renameSync,
 } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, resolve, relative, basename, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-
-const cwd = process.cwd()
 
 /**
  * @typedef {{ from?: string, skills?: string[], agents?: string[] }} Config
@@ -50,7 +55,8 @@ const cwd = process.cwd()
  * @typedef {{ hash: string, explicit: boolean, requiredBy: string[] }} AgentEntry
  * @typedef {{ version: number, source: string, skills: Record<string, SkillEntry>, agents: Record<string, AgentEntry> }} Lock
  *   Generated manifest (skills-syncer-lock.json): per-item content hash.
- * @typedef {{ root: string, cleanup: () => void }} Source
+ * @typedef {{ root: string, cleanup: () => void, sourceId: string, bundled: boolean }} Catalog
+ *   A resolved source: where it lives, how to clean it up, its lock label.
  */
 
 // Markers that fence the shared block inside a repo's AGENTS.md.
@@ -79,9 +85,9 @@ function parseListArg(argv, flag) {
 }
 
 // --- source resolution ------------------------------------------------------
-// Returns { root, cleanup }. A `github:owner/repo[#ref]` source is shallow-cloned
-// to a temp dir; a local path is used in place.
-/** @param {string} from @returns {Source} */
+// A `github:owner/repo[#ref]` source is shallow-cloned to a temp dir; a local
+// path is used in place.
+/** @param {string} from @returns {{ root: string, cleanup: () => void }} */
 function resolveSource(from) {
   if (from.startsWith('github:')) {
     const spec = from.slice('github:'.length)
@@ -103,6 +109,19 @@ function resolveSource(from) {
   const root = resolve(from)
   if (!existsSync(root)) fail(`source path does not exist: ${root}`)
   return { root, cleanup: () => {} }
+}
+
+// Resolve a catalog from `--from`/config, or fall back to a bundled catalog (a
+// repo that ships skills-syncer as its own bin). Returns a label for the lock.
+/** @param {string | undefined} from @returns {Catalog} */
+function resolveCatalog(from) {
+  if (from) {
+    const s = resolveSource(from)
+    return { root: s.root, cleanup: s.cleanup, sourceId: from, bundled: false }
+  }
+  const cat = bundledCatalogRoot()
+  if (!cat) fail('no source. pass --from <github:owner/repo | ./path>, or add it to skills-syncer.json.')
+  return { root: cat, cleanup: () => {}, sourceId: bundledName(cat) || 'bundled-catalog', bundled: true }
 }
 
 // Auto-detect where skills/agents live in the source.
@@ -178,7 +197,27 @@ function writeJsonStable(p, obj) {
   }
   writeFileSync(p, `${JSON.stringify(obj, null, 2)}\n`)
 }
-// Throw rather than process.exit, so the outer finally always runs cleanup
+
+// Atomically replace a directory: copy into a sibling temp first, so a failed
+// copy never destroys an existing dest; then swap it in.
+/** @param {string} src @param {string} dest @returns {void} */
+function installDir(src, dest) {
+  const tmp = `${dest}.skills-syncer-tmp`
+  rmSync(tmp, { recursive: true, force: true })
+  cpSync(src, tmp, { recursive: true }) // creates parents; if this throws, dest is untouched
+  rmSync(dest, { recursive: true, force: true })
+  renameSync(tmp, dest)
+}
+// Replace a file atomically (rename over an existing file is atomic on POSIX).
+/** @param {string} src @param {string} dest @returns {void} */
+function installFile(src, dest) {
+  mkdirSync(dirname(dest), { recursive: true })
+  const tmp = `${dest}.skills-syncer-tmp`
+  cpSync(src, tmp)
+  renameSync(tmp, dest)
+}
+
+// Throw rather than process.exit, so a caller's finally can run cleanup
 // (a github: source has a temp clone to remove).
 class SyncError extends Error {}
 /** @param {string} msg @returns {never} */
@@ -210,278 +249,249 @@ function bundledName(pkgRoot) {
   return (pkg && pkg.name) || null
 }
 
-const HELP = `skills-syncer — vendor Claude Code skills + agents from a catalog into your repo
+// --- the sync itself --------------------------------------------------------
+// Sync one repo (`cwd`) from a catalog. Prints its own warnings + a report line.
+// `catalog` may be pre-resolved (the caller then owns its cleanup) — `--all`
+// uses this to fetch a shared source once and reuse it across repos.
+/**
+ * @param {{ cwd: string, from?: string, skills: string[], agents: string[],
+ *           dryRun: boolean, catalog?: Catalog }} o
+ * @returns {void}
+ */
+function sync(o) {
+  const { cwd, skills, agents, dryRun } = o
+  const cat = o.catalog || resolveCatalog(o.from)
+  try {
+    const root = cat.root
+    if (resolve(root) === resolve(cwd)) fail('refusing to sync the source into itself')
 
-Usage:
-  skills-syncer --from <src> --skill <names…> [--agent <names…>]
-  skills-syncer                      re-sync using ./skills-syncer.json
-  skills-syncer --all [--root <dir>] re-sync every repo under a folder
+    const srcSkillsDir = pick(root, ['skills'], ['.claude', 'skills'])
+    const srcAgentsDir = pick(root, ['agents'], ['.claude', 'agents'])
+    const srcAgentsMd = join(root, 'AGENTS.md')
+    const manifestPath = join(root, 'skill-agents.json')
 
-Options:
-  --from <src>      catalog source: github:owner/repo[#ref] or a local path
-  --skill <names…>  skills to install ('*' = all in the catalog)
-  --agent <names…>  agents to install directly ('*' = all); agents required
-                    by a selected skill are pulled automatically
-  --all             re-sync every immediate subfolder that has a
-                    skills-syncer.json (each from its own recorded source)
-  --root <dir>      with --all, the folder to scan (default: current dir)
-  --dry-run, -n     show what would change; write nothing
-  --help, -h        show this help
-  --version, -v     print the version
+    const availableSkills = listDirs(srcSkillsDir)
+    const availableAgents = listAgents(srcAgentsDir)
+    if (!availableSkills.length && !availableAgents.length) {
+      fail(`no skills or agents found in source (looked in ${srcSkillsDir} and ${srcAgentsDir})`)
+    }
 
-Writes .claude/skills/, .claude/agents/, AGENTS.md, skills-syncer.json and
-skills-syncer-lock.json into the current repo. Commit the result.`
+    const rawManifest = readJson(manifestPath) || {}
+    /** @type {Manifest} */
+    const manifest = {}
+    for (const [skill, ags] of Object.entries(rawManifest)) {
+      if (!skill.startsWith('$')) manifest[skill] = ags // skip $comment et al.
+    }
 
-const topArgv = process.argv.slice(2)
-if (topArgv.includes('--help') || topArgv.includes('-h')) {
-  console.log(HELP)
-  process.exit(0)
+    // Expand '*' against the catalog; keep the literal selection for the intent file.
+    let skillSel = skills.includes('*') ? availableSkills.slice() : skills.slice()
+    let agentSel = agents.includes('*') ? availableAgents.slice() : agents.slice()
+    if (!skillSel.length && !agentSel.length) {
+      fail('nothing to sync: no --skill/--agent given and skills-syncer.json has no selection.')
+    }
+
+    // Drop names missing from the source; warn so a typo or deletion is visible.
+    /** @param {string[]} names @param {string[]} available @param {string} kind @returns {string[]} */
+    const keepKnown = (names, available, kind) => {
+      for (const n of names.filter((n) => !available.includes(n)))
+        console.warn(`[skills-syncer] skip ${kind} "${n}": not in source (deleted or misspelled)`)
+      return names.filter((n) => available.includes(n))
+    }
+    skillSel = keepKnown(skillSel, availableSkills, 'skill')
+    const explicitAgents = new Set(keepKnown(agentSel, availableAgents, 'agent'))
+
+    // Agents required by selected skills, via the manifest.
+    /** @type {Map<string, string[]>} */
+    const requiredBy = new Map()
+    for (const skill of skillSel) {
+      for (const role of manifest[skill] || []) {
+        if (!availableAgents.includes(role)) {
+          console.warn(`[skills-syncer] ${skill} requires agent "${role}" but it is not in source — skip`)
+          continue
+        }
+        if (!requiredBy.has(role)) requiredBy.set(role, [])
+        requiredBy.get(role)?.push(skill)
+      }
+    }
+    const agentsToInstall = new Set([...explicitAgents, ...requiredBy.keys()])
+
+    const skillsDest = join(cwd, '.claude', 'skills')
+    const agentsDest = join(cwd, '.claude', 'agents')
+    /** @type {Lock | null} */
+    const prevLock = readJson(join(cwd, 'skills-syncer-lock.json'))
+    /** @type {Lock} */
+    const lock = { version: 1, source: cat.sourceId, skills: {}, agents: {} }
+
+    // --- install skills (incremental + atomic) --------------------------------
+    for (const name of [...skillSel].sort()) {
+      const srcDir = join(srcSkillsDir, name)
+      const dest = join(skillsDest, name)
+      const prev = prevLock?.skills?.[name]
+      const exists = existsSync(dest)
+      // Never clobber a repo-authored skill: on disk but not in our lock.
+      if (exists && !prev) {
+        console.warn(`[skills-syncer] skip skill "${name}": .claude/skills/${name}/ exists but is not managed by skills-syncer (repo-authored). Remove it to vendor this skill.`)
+        continue
+      }
+      const srcHash = dirHash(srcDir)
+      const destHash = exists ? dirHash(dest) : null
+      if (prev && destHash !== null && destHash !== prev.hash) {
+        console.warn(`[skills-syncer] skill "${name}" was edited locally since last sync — ${dryRun ? 'would overwrite' : 'overwriting'}. Make the change in the source catalog instead.`)
+      }
+      // Already in sync? leave it alone. Otherwise install it atomically.
+      if (destHash !== srcHash && !dryRun) installDir(srcDir, dest)
+      lock.skills[name] = { hash: srcHash }
+    }
+
+    // --- install agents -------------------------------------------------------
+    for (const role of [...agentsToInstall].sort()) {
+      const srcFile = join(srcAgentsDir, `${role}.md`)
+      const dest = join(agentsDest, `${role}.md`)
+      const prev = prevLock?.agents?.[role]
+      const exists = existsSync(dest)
+      if (exists && !prev) {
+        console.warn(`[skills-syncer] skip agent "${role}": .claude/agents/${role}.md exists but is not managed by skills-syncer (repo-authored). Remove it to vendor this agent.`)
+        continue
+      }
+      const srcHash = fileHash(srcFile)
+      const destHash = exists ? fileHash(dest) : null
+      if (prev && destHash !== null && destHash !== prev.hash) {
+        console.warn(`[skills-syncer] agent "${role}" was edited locally since last sync — ${dryRun ? 'would overwrite' : 'overwriting'}. Make the change in the source catalog instead.`)
+      }
+      if (destHash !== srcHash && !dryRun) installFile(srcFile, dest)
+      lock.agents[role] = {
+        hash: srcHash,
+        explicit: explicitAgents.has(role),
+        requiredBy: (requiredBy.get(role) || []).sort(),
+      }
+    }
+
+    // --- cleanup: drop what is no longer selected -----------------------------
+    /** @type {{ skills: string[], agents: string[] }} */
+    const removed = { skills: [], agents: [] }
+    for (const name of prevLock?.skills ? Object.keys(prevLock.skills) : []) {
+      if (lock.skills[name]) continue
+      const dest = join(skillsDest, name)
+      if (existsSync(dest)) {
+        if (!dryRun) rmSync(dest, { recursive: true, force: true })
+        removed.skills.push(name)
+      }
+    }
+    // Only agents OUR lock installed are eligible for removal — never a repo-authored one.
+    for (const role of prevLock?.agents ? Object.keys(prevLock.agents) : []) {
+      if (lock.agents[role]) continue
+      const dest = join(agentsDest, `${role}.md`)
+      if (existsSync(dest)) {
+        if (!dryRun) rmSync(dest, { force: true })
+        removed.agents.push(role)
+      }
+    }
+
+    // --- shared AGENTS.md block + persisted state -----------------------------
+    const wroteAgentsMd = syncAgentsMd(cwd, srcAgentsMd, dryRun)
+    if (!dryRun) {
+      // A bundled catalog has no stable `from` to record (its path is an
+      // ephemeral npx checkout); the intent keeps only the selection.
+      const intent = cat.bundled ? { skills, agents } : { from: o.from, skills, agents }
+      writeJsonStable(join(cwd, 'skills-syncer.json'), intent)
+      writeJsonStable(join(cwd, 'skills-syncer-lock.json'), lock)
+    }
+
+    // --- report ---------------------------------------------------------------
+    const repoName = basename(cwd)
+    const nSkills = Object.keys(lock.skills).length
+    const nAgents = Object.keys(lock.agents).length
+    const verb = dryRun ? 'would sync' : 'synced'
+    console.log(
+      `[skills-syncer]${dryRun ? ' (dry-run)' : ''} ${verb} ${nSkills} skill(s)` +
+        (nAgents ? ` + ${nAgents} agent(s)` : '') +
+        (wroteAgentsMd ? ' + AGENTS.md' : '') +
+        ` into ${repoName} (from ${cat.sourceId})`,
+    )
+    const rverb = dryRun ? 'would remove' : 'removed'
+    if (removed.skills.length) console.log(`[skills-syncer] ${rverb} skills: ${removed.skills.join(', ')}`)
+    if (removed.agents.length) console.log(`[skills-syncer] ${rverb} agents: ${removed.agents.join(', ')}`)
+    if (dryRun) console.log('[skills-syncer] dry run — nothing written. Re-run without --dry-run to apply.')
+  } finally {
+    if (!o.catalog) cat.cleanup()
+  }
 }
-if (topArgv.includes('--version') || topArgv.includes('-v')) {
-  console.log(readVersion())
-  process.exit(0)
-}
 
-// --- fleet mode: re-sync every repo under a folder --------------------------
-// `--all` runs this same tool, bare, in each immediate subfolder that already
-// has a skills-syncer.json — so each repo re-syncs from its OWN recorded source
-// and selection. Different repos may point at different catalogs. `--dry-run`
-// is passed through. Worktrees and nested repos are not reached (one level deep).
-if (topArgv.includes('--all')) {
-  const rootArg = parseValueArg(topArgv, '--root')
-  const root = rootArg ? resolve(rootArg) : cwd
-  const pass = topArgv.includes('--dry-run') || topArgv.includes('-n') ? ['--dry-run'] : []
-  const self = fileURLToPath(import.meta.url)
-  /** @type {string[]} */
-  const ok = []
-  /** @type {string[]} */
-  const failed = []
-  let skipped = 0
-  for (const e of readdirSync(root, { withFileTypes: true })) {
-    if (!e.isDirectory()) continue
-    const repo = join(root, e.name)
-    if (!existsSync(join(repo, 'skills-syncer.json'))) {
-      skipped++
+// --- fleet mode -------------------------------------------------------------
+// Re-sync every immediate subfolder of `root` that has a skills-syncer.json,
+// each from its OWN recorded source + selection. Repos are grouped by source so
+// a shared catalog is fetched once, not once per repo.
+/** @param {{ root: string, dryRun: boolean }} o @returns {number} exit code */
+function runAll(o) {
+  const { root, dryRun } = o
+  const dirs = readdirSync(root, { withFileTypes: true }).filter((e) => e.isDirectory())
+  const repos = dirs.filter((e) => existsSync(join(root, e.name, 'skills-syncer.json'))).map((e) => e.name)
+  const skipped = dirs.length - repos.length
+
+  /** @type {Map<string, { from: string | undefined, repos: string[] }>} */
+  const groups = new Map()
+  for (const name of repos) {
+    /** @type {Config} */
+    const cfg = readJson(join(root, name, 'skills-syncer.json')) || {}
+    const key = cfg.from || '<bundled>'
+    if (!groups.has(key)) groups.set(key, { from: cfg.from, repos: [] })
+    groups.get(key)?.repos.push(name)
+  }
+
+  /** @type {string[]} */ const ok = []
+  /** @type {string[]} */ const failed = []
+  for (const grp of groups.values()) {
+    const catalog = tryResolve(grp.from)
+    if (!catalog) {
+      for (const name of grp.repos) {
+        console.error(`[skills-syncer] --all ✗ ${name}: source could not be resolved`)
+        failed.push(name)
+      }
       continue
     }
-    console.log(`[skills-syncer] --all → ${e.name}`)
-    const res = spawnSync(process.execPath, [self, ...pass], { cwd: repo, stdio: 'inherit' })
-    if (res.status === 0) ok.push(e.name)
-    else failed.push(e.name)
+    try {
+      for (const name of grp.repos) {
+        /** @type {Config} */
+        const cfg = readJson(join(root, name, 'skills-syncer.json')) || {}
+        console.log(`[skills-syncer] --all → ${name}`)
+        try {
+          sync({ cwd: join(root, name), from: grp.from, skills: cfg.skills || [], agents: cfg.agents || [], dryRun, catalog })
+          ok.push(name)
+        } catch (err) {
+          if (!(err instanceof SyncError)) throw err
+          console.error(`[skills-syncer] ${err.message}`)
+          failed.push(name)
+        }
+      }
+    } finally {
+      catalog.cleanup()
+    }
   }
+
   console.log(
-    `[skills-syncer] --all: ${pass.length ? 'previewed' : 'synced'} ${ok.length} repo(s)` +
+    `[skills-syncer] --all: ${dryRun ? 'previewed' : 'synced'} ${ok.length} repo(s)` +
       `, skipped ${skipped} (no skills-syncer.json)` +
       (failed.length ? `, failed: ${failed.join(', ')}` : ''),
   )
-  process.exit(failed.length ? 1 : 0)
+  return failed.length ? 1 : 0
 }
-
-// --- resolve source + selection ---------------------------------------------
-let cleanup = () => {}
-try {
-  const argv = process.argv.slice(2)
-  const dryRun = argv.includes('--dry-run') || argv.includes('-n')
-  const config = readJson(join(cwd, 'skills-syncer.json')) || {}
-
-  const from = parseValueArg(argv, '--from') || config.from
-  let bundled = false
-  /** @type {string} the human label for the source, recorded in the lock */
-  let sourceId
-  let src
-  if (from) {
-    src = resolveSource(from)
-    sourceId = from
-  } else {
-    const cat = bundledCatalogRoot()
-    if (!cat) {
-      fail('no source. pass --from <github:owner/repo | ./path>, or add it to skills-syncer.json.')
-    }
-    bundled = true
-    src = { root: cat, cleanup: () => {} }
-    sourceId = bundledName(cat) || 'bundled-catalog'
-  }
-  const root = src.root
-  cleanup = src.cleanup
-
-  const srcSkillsDir = pick(root, ['skills'], ['.claude', 'skills'])
-  const srcAgentsDir = pick(root, ['agents'], ['.claude', 'agents'])
-  const srcAgentsMd = join(root, 'AGENTS.md')
-  const manifestPath = join(root, 'skill-agents.json')
-
-  // Refuse to sync a local source into itself.
-  if (resolve(root) === resolve(cwd)) fail('refusing to sync the source into itself')
-
-  const availableSkills = listDirs(srcSkillsDir)
-  const availableAgents = listAgents(srcAgentsDir)
-  if (!availableSkills.length && !availableAgents.length) {
-    fail(`no skills or agents found in source (looked in ${srcSkillsDir} and ${srcAgentsDir})`)
-  }
-
-  const rawManifest = readJson(manifestPath) || {}
-  /** @type {Manifest} */
-  const manifest = {}
-  for (const [skill, agents] of Object.entries(rawManifest)) {
-    if (!skill.startsWith('$')) manifest[skill] = agents // skip $comment et al.
-  }
-
-  // Literal selection: CLI wins, else config. Keep '*' literal so re-syncs stay dynamic.
-  const argSkills = parseListArg(argv, '--skill')
-  const argAgents = parseListArg(argv, '--agent')
-  const skillLiteral = argSkills?.length ? argSkills : config.skills || []
-  const agentLiteral = argAgents?.length ? argAgents : config.agents || []
-
-  let skillSel = skillLiteral.includes('*') ? availableSkills.slice() : skillLiteral.slice()
-  let agentSel = agentLiteral.includes('*') ? availableAgents.slice() : agentLiteral.slice()
-
-  if (!skillSel.length && !agentSel.length) {
-    fail('nothing to sync: no --skill/--agent given and skills-syncer.json has no selection.')
-  }
-
-  // Drop names missing from the source; warn so a typo or deletion is visible.
-  /** @param {string[]} names @param {string[]} available @param {string} kind @returns {string[]} */
-  const keepKnown = (names, available, kind) => {
-    for (const n of names.filter((n) => !available.includes(n)))
-      console.warn(`[skills-syncer] skip ${kind} "${n}": not in source (deleted or misspelled)`)
-    return names.filter((n) => available.includes(n))
-  }
-  skillSel = keepKnown(skillSel, availableSkills, 'skill')
-  const explicitAgents = new Set(keepKnown(agentSel, availableAgents, 'agent'))
-
-  // Agents required by selected skills, via the manifest.
-  /** @type {Map<string, string[]>} */
-  const requiredBy = new Map()
-  for (const skill of skillSel) {
-    for (const role of manifest[skill] || []) {
-      if (!availableAgents.includes(role)) {
-        console.warn(`[skills-syncer] ${skill} requires agent "${role}" but it is not in source — skip`)
-        continue
-      }
-      if (!requiredBy.has(role)) requiredBy.set(role, [])
-      requiredBy.get(role)?.push(skill)
-    }
-  }
-  const agentsToInstall = new Set([...explicitAgents, ...requiredBy.keys()])
-
-  // --- install --------------------------------------------------------------
-  const skillsDest = join(cwd, '.claude', 'skills')
-  const agentsDest = join(cwd, '.claude', 'agents')
-  /** @type {Lock | null} */
-  const prevLock = readJson(join(cwd, 'skills-syncer-lock.json'))
-  /** @type {Lock} */
-  const lock = { version: 1, source: sourceId, skills: {}, agents: {} }
-
-  for (const name of [...skillSel].sort()) {
-    const src = join(srcSkillsDir, name)
-    const dest = join(skillsDest, name)
-    const prev = prevLock?.skills?.[name]
-    // Never clobber a repo-authored skill: if it exists on disk but our lock did
-    // not install it, it is the repo's own — skip it and say so.
-    if (existsSync(dest) && !prev) {
-      console.warn(`[skills-syncer] skip skill "${name}": .claude/skills/${name}/ exists but is not managed by skills-syncer (repo-authored). Remove it to vendor this skill.`)
-      continue
-    }
-    // Our own copy, edited locally since last sync: about to be overwritten.
-    if (prev && existsSync(dest) && dirHash(dest) !== prev.hash) {
-      console.warn(`[skills-syncer] skill "${name}" was edited locally since last sync — ${dryRun ? 'would overwrite' : 'overwriting'}. Make the change in the source catalog instead.`)
-    }
-    if (!dryRun) {
-      rmSync(dest, { recursive: true, force: true })
-      mkdirSync(dest, { recursive: true })
-      cpSync(src, dest, { recursive: true })
-    }
-    lock.skills[name] = { hash: dirHash(src) }
-  }
-
-  if (agentsToInstall.size && !dryRun) mkdirSync(agentsDest, { recursive: true })
-  for (const role of [...agentsToInstall].sort()) {
-    const src = join(srcAgentsDir, `${role}.md`)
-    const dest = join(agentsDest, `${role}.md`)
-    const prev = prevLock?.agents?.[role]
-    if (existsSync(dest) && !prev) {
-      console.warn(`[skills-syncer] skip agent "${role}": .claude/agents/${role}.md exists but is not managed by skills-syncer (repo-authored). Remove it to vendor this agent.`)
-      continue
-    }
-    if (prev && existsSync(dest) && fileHash(dest) !== prev.hash) {
-      console.warn(`[skills-syncer] agent "${role}" was edited locally since last sync — ${dryRun ? 'would overwrite' : 'overwriting'}. Make the change in the source catalog instead.`)
-    }
-    if (!dryRun) {
-      rmSync(dest, { force: true })
-      cpSync(src, dest)
-    }
-    lock.agents[role] = {
-      hash: fileHash(src),
-      explicit: explicitAgents.has(role),
-      requiredBy: (requiredBy.get(role) || []).sort(),
-    }
-  }
-
-  // --- cleanup: drop what is no longer selected -----------------------------
-  /** @type {{ skills: string[], agents: string[] }} */
-  const removed = { skills: [], agents: [] }
-  for (const name of prevLock?.skills ? Object.keys(prevLock.skills) : []) {
-    if (lock.skills[name]) continue
-    const dest = join(skillsDest, name)
-    if (existsSync(dest)) {
-      if (!dryRun) rmSync(dest, { recursive: true, force: true })
-      removed.skills.push(name)
-    }
-  }
-  // Only agents OUR lock installed are eligible for removal — never a repo-authored one.
-  for (const role of prevLock?.agents ? Object.keys(prevLock.agents) : []) {
-    if (lock.agents[role]) continue
-    const dest = join(agentsDest, `${role}.md`)
-    if (existsSync(dest)) {
-      if (!dryRun) rmSync(dest, { force: true })
-      removed.agents.push(role)
-    }
-  }
-
-  // --- shared AGENTS.md block -----------------------------------------------
-  const wroteAgentsMd = syncAgentsMd(srcAgentsMd, dryRun)
-
-  // --- persist config + lock ------------------------------------------------
-  // A bundled catalog has no stable `from` to record (the path is an ephemeral
-  // npx checkout), so the intent file keeps only the selection — a bare re-sync
-  // falls back to the bundled catalog again.
-  if (!dryRun) {
-    const intent = bundled
-      ? { skills: skillLiteral, agents: agentLiteral }
-      : { from, skills: skillLiteral, agents: agentLiteral }
-    writeJsonStable(join(cwd, 'skills-syncer.json'), intent)
-    writeJsonStable(join(cwd, 'skills-syncer-lock.json'), lock)
-  }
-
-  // --- report ---------------------------------------------------------------
-  const repo = basename(cwd)
-  const nSkills = Object.keys(lock.skills).length
-  const nAgents = Object.keys(lock.agents).length
-  const verb = dryRun ? 'would sync' : 'synced'
-  console.log(
-    `[skills-syncer]${dryRun ? ' (dry-run)' : ''} ${verb} ${nSkills} skill(s)` +
-      (nAgents ? ` + ${nAgents} agent(s)` : '') +
-      (wroteAgentsMd ? ' + AGENTS.md' : '') +
-      ` into ${repo} (from ${sourceId})`,
-  )
-  const rverb = dryRun ? 'would remove' : 'removed'
-  if (removed.skills.length) console.log(`[skills-syncer] ${rverb} skills: ${removed.skills.join(', ')}`)
-  if (removed.agents.length) console.log(`[skills-syncer] ${rverb} agents: ${removed.agents.join(', ')}`)
-  if (dryRun) console.log('[skills-syncer] dry run — nothing written. Re-run without --dry-run to apply.')
-} catch (err) {
-  if (err instanceof SyncError) {
+// Resolve a catalog, or report + return null on a SyncError (so --all can carry on).
+/** @param {string | undefined} from @returns {Catalog | null} */
+function tryResolve(from) {
+  try {
+    return resolveCatalog(from)
+  } catch (err) {
+    if (!(err instanceof SyncError)) throw err
     console.error(`[skills-syncer] ${err.message}`)
-    process.exitCode = 1
-  } else {
-    throw err
+    return null
   }
-} finally {
-  cleanup()
 }
 
+// --- AGENTS.md merge --------------------------------------------------------
 // Put the shared block at the top of the repo's AGENTS.md, keeping repo-specific
 // notes below it. Idempotent: re-running replaces only the fenced block.
-/** @param {string} srcAgentsMd @param {boolean} dryRun @returns {boolean} */
-function syncAgentsMd(srcAgentsMd, dryRun) {
+/** @param {string} cwd @param {string} srcAgentsMd @param {boolean} dryRun @returns {boolean} */
+function syncAgentsMd(cwd, srcAgentsMd, dryRun) {
   if (!existsSync(srcAgentsMd)) return false
   const shared = readFileSync(srcAgentsMd, 'utf8').trim()
   const block = `${SHARED_BEGIN}\n\n${shared}\n\n${SHARED_END}`
@@ -508,7 +518,7 @@ function syncAgentsMd(srcAgentsMd, dryRun) {
     }
   }
   if (!body.endsWith('\n')) body += '\n'
-  if (!dryRun) writeFileSync(dest, body)
+  if (!dryRun && (!existsSync(dest) || readFileSync(dest, 'utf8') !== body)) writeFileSync(dest, body)
   return true
 }
 
@@ -527,3 +537,61 @@ function stripForeignFence(text, shared) {
   const close = afterShared.indexOf('-->')
   return close === -1 ? text : afterShared.slice(close + 3)
 }
+
+// --- CLI entry --------------------------------------------------------------
+const HELP = `skills-syncer — vendor Claude Code skills + agents from a catalog into your repo
+
+Usage:
+  skills-syncer --from <src> --skill <names…> [--agent <names…>]
+  skills-syncer                      re-sync using ./skills-syncer.json
+  skills-syncer --all [--root <dir>] re-sync every repo under a folder
+
+Options:
+  --from <src>      catalog source: github:owner/repo[#ref] or a local path
+  --skill <names…>  skills to install ('*' = all in the catalog)
+  --agent <names…>  agents to install directly ('*' = all); agents required
+                    by a selected skill are pulled automatically
+  --all             re-sync every immediate subfolder that has a
+                    skills-syncer.json (each from its own recorded source)
+  --root <dir>      with --all, the folder to scan (default: current dir)
+  --dry-run, -n     show what would change; write nothing
+  --help, -h        show this help
+  --version, -v     print the version
+
+Writes .claude/skills/, .claude/agents/, AGENTS.md, skills-syncer.json and
+skills-syncer-lock.json into the current repo. Commit the result.`
+
+function main() {
+  const argv = process.argv.slice(2)
+  if (argv.includes('--help') || argv.includes('-h')) return console.log(HELP)
+  if (argv.includes('--version') || argv.includes('-v')) return console.log(readVersion())
+
+  const dryRun = argv.includes('--dry-run') || argv.includes('-n')
+
+  if (argv.includes('--all')) {
+    const rootArg = parseValueArg(argv, '--root')
+    process.exitCode = runAll({ root: rootArg ? resolve(rootArg) : process.cwd(), dryRun })
+    return
+  }
+
+  try {
+    const cwd = process.cwd()
+    /** @type {Config} */
+    const config = readJson(join(cwd, 'skills-syncer.json')) || {}
+    const from = parseValueArg(argv, '--from') || config.from
+    const argSkills = parseListArg(argv, '--skill')
+    const argAgents = parseListArg(argv, '--agent')
+    const skills = argSkills?.length ? argSkills : config.skills || []
+    const agents = argAgents?.length ? argAgents : config.agents || []
+    sync({ cwd, from: from || undefined, skills, agents, dryRun })
+  } catch (err) {
+    if (err instanceof SyncError) {
+      console.error(`[skills-syncer] ${err.message}`)
+      process.exitCode = 1
+    } else {
+      throw err
+    }
+  }
+}
+
+main()

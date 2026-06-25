@@ -16,6 +16,8 @@ import {
   readFileSync,
   copyFileSync,
   existsSync,
+  utimesSync,
+  statSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
@@ -255,6 +257,34 @@ test('a bundled catalog is used as the source when no --from is given', () => {
   const r2 = run(repo, [], { _bin: bin })
   assert.equal(r2.status, 0, r2.stderr)
   assert.ok(has(repo, '.claude', 'skills', 'foo', 'SKILL.md'))
+})
+
+test('a re-sync does not touch a skill folder whose content is unchanged', () => {
+  const repo = newRepo()
+  run(repo, ['--from', CATALOG, '--skill', 'hello-rules'])
+  const dir = join(repo, '.claude', 'skills', 'hello-rules')
+  // stamp a distinct old mtime; a real reinstall (rm + copy) would reset it
+  const old = new Date('2020-01-01T00:00:00Z')
+  utimesSync(dir, old, old)
+  const r = run(repo, []) // bare re-sync — content is identical
+  assert.equal(r.status, 0, r.stderr)
+  assert.equal(statSync(dir).mtime.getTime(), old.getTime(), 'unchanged skill was not reinstalled')
+})
+
+test('--all keeps going when one repo’s source cannot be resolved', () => {
+  const fleet = mkdtempSync(join(tmpdir(), 'sst-fleet-'))
+  const good = join(fleet, 'good')
+  const bad = join(fleet, 'bad')
+  mkdirSync(good, { recursive: true })
+  mkdirSync(bad, { recursive: true })
+  writeFileSync(join(good, 'skills-syncer.json'), JSON.stringify({ from: CATALOG, skills: ['hello-rules'], agents: [] }))
+  writeFileSync(join(bad, 'skills-syncer.json'), JSON.stringify({ from: join(fleet, 'no-such-catalog'), skills: ['x'], agents: [] }))
+
+  const r = run(fleet, ['--all', '--root', fleet])
+  assert.equal(r.status, 1, 'a failed repo makes the run exit non-zero')
+  assert.match(r.stdout, /synced 1 repo\(s\).*failed: bad/)
+  assert.ok(has(good, '.claude', 'skills', 'hello-rules'), 'the healthy repo still synced')
+  assert.ok(!has(bad, '.claude'), 'the broken repo wrote nothing')
 })
 
 test('a re-sync leaves a reformatted state file untouched (no churn)', () => {
