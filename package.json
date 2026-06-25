@@ -1,6 +1,6 @@
 {
   "name": "skills-syncer",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Vendor Claude Code skills and subagents from any catalog repo into your repo, with a lockfile and content hashing. Run via npx.",
   "keywords": [
     "claude",
