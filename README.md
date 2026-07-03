@@ -183,7 +183,10 @@ local path — laid out like this:
   an orchestrator skill never leaves it without its agents.
 - **`AGENTS.md`** is merged into the top of the target repo's `AGENTS.md` inside
   fenced markers; repo-specific notes below the block are preserved across
-  re-syncs.
+  re-syncs. Alongside it the sync links `CLAUDE.md` → `AGENTS.md` so Claude Code
+  reads the same instructions. The link target is a sibling in the same repo, so
+  it still rides with git into worktrees and sandboxes. A repo-authored real
+  `CLAUDE.md` is left untouched (remove it to opt in).
 
 ### Bundled catalog (ship the tool with your catalog)
 
@@ -212,6 +215,7 @@ bundled catalog again).
 | `.claude/skills/<name>/` | each selected skill folder (real copy) |
 | `.claude/agents/<role>.md` | each selected/required agent (registered subagent) |
 | `AGENTS.md` | shared block merged in, repo notes kept below |
+| `CLAUDE.md` | symlink → `AGENTS.md` (skipped if a real `CLAUDE.md` exists) |
 | `skills-syncer.json` | your choice: source + selection (hand-editable, committed) |
 | `skills-syncer-lock.json` | generated manifest: per-item content hash |
 

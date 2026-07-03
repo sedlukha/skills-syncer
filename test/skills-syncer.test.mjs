@@ -18,6 +18,10 @@ import {
   existsSync,
   utimesSync,
   statSync,
+  lstatSync,
+  readlinkSync,
+  symlinkSync,
+  unlinkSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
@@ -370,4 +374,43 @@ test('--all warns that it ignores --skill, then still runs', () => {
   assert.equal(r.status, 0, r.stderr)
   assert.match(r.stderr, /--all ignores --skill/)
   assert.ok(has(repo, '.claude', 'skills', 'hello-rules'))
+})
+
+/** @param {string} repo @returns {boolean} */
+const isLink = (repo) => lstatSync(join(repo, 'CLAUDE.md')).isSymbolicLink()
+
+test('CLAUDE.md is created as a symlink to AGENTS.md', () => {
+  const repo = newRepo()
+  const r = run(repo, ['--from', CATALOG, '--skill', 'hello-rules'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.ok(isLink(repo), 'CLAUDE.md is a symlink')
+  assert.equal(readlinkSync(join(repo, 'CLAUDE.md')), 'AGENTS.md', 'points at the sibling AGENTS.md')
+  // Following the link yields the shared AGENTS.md content.
+  assert.equal(read(repo, 'CLAUDE.md'), read(repo, 'AGENTS.md'))
+})
+
+test('--dry-run does not create the CLAUDE.md symlink', () => {
+  const repo = newRepo()
+  const r = run(repo, ['--from', CATALOG, '--skill', 'hello-rules', '--dry-run'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.ok(!has(repo, 'CLAUDE.md'), 'nothing written on a dry run')
+})
+
+test('a stale CLAUDE.md symlink is repointed at AGENTS.md', () => {
+  const repo = newRepo()
+  symlinkSync('README.md', join(repo, 'CLAUDE.md'))
+  const r = run(repo, ['--from', CATALOG, '--skill', 'hello-rules'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.ok(isLink(repo))
+  assert.equal(readlinkSync(join(repo, 'CLAUDE.md')), 'AGENTS.md')
+})
+
+test('a repo-authored real CLAUDE.md is left untouched, with a warning', () => {
+  const repo = newRepo()
+  writeFileSync(join(repo, 'CLAUDE.md'), 'MY OWN FILE\n')
+  const r = run(repo, ['--from', CATALOG, '--skill', 'hello-rules'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.ok(!isLink(repo), 'still a real file')
+  assert.equal(read(repo, 'CLAUDE.md'), 'MY OWN FILE\n', 'content preserved')
+  assert.match(r.stderr, /skip CLAUDE\.md symlink/)
 })

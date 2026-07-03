@@ -15,6 +15,9 @@
 //   ./AGENTS.md                <- the catalog's shared block, merged in (if present)
 //   ./skills-syncer.json           <- your choice: source + selection (hand-editable)
 //   ./skills-syncer-lock.json      <- generated manifest: per-item content hash
+// The one exception is a same-repo symlink CLAUDE.md -> AGENTS.md, so Claude Code
+// reads the shared instructions too. Its target sits in the same repo, so it
+// still rides with git into worktrees and the sandbox (a cross-repo link would not).
 //
 // The SOURCE is just a directory (local path or a github: repo) laid out as:
 //   skills/<name>/   or  .claude/skills/<name>/     (auto-detected)
@@ -40,6 +43,10 @@ import {
   readFileSync,
   writeFileSync,
   renameSync,
+  symlinkSync,
+  lstatSync,
+  readlinkSync,
+  unlinkSync,
 } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { execFileSync, spawnSync } from 'node:child_process'
@@ -81,12 +88,14 @@ const SYM = { ok: COLOR ? '✓' : 'OK', fail: COLOR ? '✗' : 'XX', skip: COLOR 
 
 // Human-readable summary of what a sync touched: "36 skills · 6 agents · AGENTS.md".
 /** @param {{ nSkills: number, nAgents: number, wroteAgentsMd: boolean,
+ *            claudeLink?: 'created' | 'fixed' | 'ok' | 'skipped' | null,
  *            removed: { skills: string[], agents: string[] } }} r @returns {string} */
 function describe(r) {
   const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`
   const parts = [plural(r.nSkills, 'skill')]
   if (r.nAgents) parts.push(plural(r.nAgents, 'agent'))
   if (r.wroteAgentsMd) parts.push('AGENTS.md')
+  if (r.claudeLink === 'created' || r.claudeLink === 'fixed') parts.push('CLAUDE.md↝AGENTS.md')
   let out = parts.join(c.dim(' · '))
   const nRemoved = r.removed.skills.length + r.removed.agents.length
   if (nRemoved) out += `  ${c.yellow(`−${nRemoved} removed`)}`
@@ -285,7 +294,9 @@ function bundledName(pkgRoot) {
 // uses this to fetch a shared source once and reuse it across repos.
 /**
  * @typedef {{ repoName: string, nSkills: number, nAgents: number,
- *             wroteAgentsMd: boolean, sourceId: string,
+ *             wroteAgentsMd: boolean,
+ *             claudeLink: 'created' | 'fixed' | 'ok' | 'skipped' | null,
+ *             sourceId: string,
  *             removed: { skills: string[], agents: string[] } }} SyncResult
  * @param {{ cwd: string, from?: string, skills: string[], agents: string[],
  *           dryRun: boolean, catalog?: Catalog, quiet?: boolean }} o
@@ -422,6 +433,8 @@ function sync(o) {
 
     // --- shared AGENTS.md block + persisted state -----------------------------
     const wroteAgentsMd = syncAgentsMd(cwd, srcAgentsMd, dryRun)
+    // Mirror AGENTS.md as CLAUDE.md via a symlink so Claude Code picks it up too.
+    const claudeLink = wroteAgentsMd ? syncClaudeMdLink(cwd, dryRun) : null
     if (!dryRun) {
       // A bundled catalog has no stable `from` to record (its path is an
       // ephemeral npx checkout); the intent keeps only the selection.
@@ -437,6 +450,7 @@ function sync(o) {
       nSkills: Object.keys(lock.skills).length,
       nAgents: Object.keys(lock.agents).length,
       wroteAgentsMd,
+      claudeLink,
       sourceId: cat.sourceId,
       removed,
     }
@@ -579,6 +593,38 @@ function syncAgentsMd(cwd, srcAgentsMd, dryRun) {
   if (!body.endsWith('\n')) body += '\n'
   if (!dryRun && (!existsSync(dest) || readFileSync(dest, 'utf8') !== body)) writeFileSync(dest, body)
   return true
+}
+
+// --- CLAUDE.md → AGENTS.md symlink ------------------------------------------
+// AGENTS.md is the cross-tool standard; CLAUDE.md is Claude Code's own name for
+// the same instructions. Point CLAUDE.md at AGENTS.md so both stay identical
+// with no duplicated content. The link target is a sibling in the SAME repo, so
+// it rides with git into every worktree and the Docker sandbox — unlike a
+// cross-repo symlink, it never dangles. A repo-authored real CLAUDE.md is left
+// untouched (we never clobber a real file). Idempotent.
+/** @param {string} cwd @param {boolean} dryRun
+ *  @returns {'created' | 'fixed' | 'ok' | 'skipped' | null} */
+function syncClaudeMdLink(cwd, dryRun) {
+  const target = 'AGENTS.md'
+  const dest = join(cwd, 'CLAUDE.md')
+  let state
+  try {
+    state = lstatSync(dest)
+  } catch {
+    if (!dryRun) symlinkSync(target, dest)
+    return 'created'
+  }
+  if (state.isSymbolicLink()) {
+    if (readlinkSync(dest) === target) return 'ok'
+    if (!dryRun) {
+      unlinkSync(dest)
+      symlinkSync(target, dest)
+    }
+    return 'fixed'
+  }
+  // A real file/dir the repo authored — do not overwrite it.
+  console.warn(`[skills-syncer] skip CLAUDE.md symlink: ${dest} is a real file, not a symlink. Remove it to link CLAUDE.md → AGENTS.md.`)
+  return 'skipped'
 }
 
 // --- CLI entry --------------------------------------------------------------
