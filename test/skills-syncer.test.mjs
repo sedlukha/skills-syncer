@@ -414,3 +414,77 @@ test('a repo-authored real CLAUDE.md is left untouched, with a warning', () => {
   assert.equal(read(repo, 'CLAUDE.md'), 'MY OWN FILE\n', 'content preserved')
   assert.match(r.stderr, /skip CLAUDE\.md symlink/)
 })
+
+test('--no-claude-link skips the symlink and records the opt-out', () => {
+  const repo = newRepo()
+  const r = run(repo, ['--from', CATALOG, '--skill', 'hello-rules', '--no-claude-link'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.ok(!has(repo, 'CLAUDE.md'), 'no CLAUDE.md written')
+  assert.equal(config(repo).claudeLink, false, 'opt-out recorded in skills-syncer.json')
+  // The opt-out survives a plain re-sync that passes no flags.
+  const again = run(repo, [])
+  assert.equal(again.status, 0, again.stderr)
+  assert.ok(!has(repo, 'CLAUDE.md'), 'still no CLAUDE.md')
+  assert.equal(config(repo).claudeLink, false)
+})
+
+test('--no-claude-link removes a link this tool made', () => {
+  const repo = newRepo()
+  run(repo, ['--from', CATALOG, '--skill', 'hello-rules'])
+  assert.ok(isLink(repo), 'linked by the first sync')
+  const r = run(repo, ['--no-claude-link'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.ok(!has(repo, 'CLAUDE.md'), 'link removed')
+  assert.ok(has(repo, 'AGENTS.md'), 'AGENTS.md untouched')
+})
+
+test('--no-claude-link leaves a repo-authored CLAUDE.md alone', () => {
+  const repo = newRepo()
+  writeFileSync(join(repo, 'CLAUDE.md'), 'MY OWN FILE\n')
+  symlinkSync('README.md', join(repo, 'OTHER.md'))
+  const r = run(repo, ['--from', CATALOG, '--skill', 'hello-rules', '--no-claude-link'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.equal(read(repo, 'CLAUDE.md'), 'MY OWN FILE\n', 'real file preserved')
+  assert.doesNotMatch(r.stderr, /skip CLAUDE\.md symlink/, 'no warning when the link is off')
+})
+
+test('--no-claude-link --dry-run removes nothing', () => {
+  const repo = newRepo()
+  run(repo, ['--from', CATALOG, '--skill', 'hello-rules'])
+  const r = run(repo, ['--no-claude-link', '--dry-run'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.ok(isLink(repo), 'link still there')
+  assert.equal(config(repo).claudeLink, undefined, 'opt-out not recorded on a dry run')
+})
+
+test('--claude-link opts a repo back in', () => {
+  const repo = newRepo()
+  run(repo, ['--from', CATALOG, '--skill', 'hello-rules', '--no-claude-link'])
+  const r = run(repo, ['--claude-link'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.ok(isLink(repo), 'link restored')
+  assert.equal(config(repo).claudeLink, undefined, 'opt-out dropped from skills-syncer.json')
+})
+
+test('--claude-link and --no-claude-link together fail', () => {
+  const repo = newRepo()
+  const r = run(repo, ['--from', CATALOG, '--skill', 'hello-rules', '--claude-link', '--no-claude-link'])
+  assert.equal(r.status, 1)
+  assert.match(r.stderr, /contradict/)
+})
+
+test('--all --no-claude-link opts every repo out at once', () => {
+  const root = mkdtempSync(join(tmpdir(), 'sst-root-'))
+  for (const name of ['a', 'b']) {
+    const repo = join(root, name)
+    mkdirSync(repo)
+    run(repo, ['--from', CATALOG, '--skill', 'hello-rules'])
+    assert.ok(isLink(repo), `${name} linked by the first sync`)
+  }
+  const r = run(root, ['--all'].concat('--no-claude-link'))
+  assert.equal(r.status, 0, r.stderr)
+  for (const name of ['a', 'b']) {
+    assert.ok(!has(join(root, name), 'CLAUDE.md'), `${name} link removed`)
+    assert.equal(config(join(root, name)).claudeLink, false, `${name} opt-out recorded`)
+  }
+})

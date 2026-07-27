@@ -159,6 +159,8 @@ npx skills-syncer --from github:acme/our-skills --skill '*' --dry-run
 | `--agent <names…>` | agents to install directly (`'*'` = all); a selected skill's required agents come automatically |
 | `--all` | re-sync every immediate subfolder that has a `skills-syncer.json` |
 | `--root <dir>` | with `--all`, the folder to scan (default: current dir) |
+| `--no-claude-link` | don't link `CLAUDE.md` → `AGENTS.md`; remove one this tool made. Recorded in `skills-syncer.json`; applies to `--all` too |
+| `--claude-link` | opt back in: link `CLAUDE.md` → `AGENTS.md` again |
 | `--dry-run`, `-n` | show what would change; write nothing |
 | `--help`, `-h` | show usage |
 | `--version`, `-v` | print the version |
@@ -186,7 +188,27 @@ local path — laid out like this:
   re-syncs. Alongside it the sync links `CLAUDE.md` → `AGENTS.md` so Claude Code
   reads the same instructions. The link target is a sibling in the same repo, so
   it still rides with git into worktrees and sandboxes. A repo-authored real
-  `CLAUDE.md` is left untouched (remove it to opt in).
+  `CLAUDE.md` is left untouched (remove it to opt in), and `--no-claude-link`
+  turns the link off entirely — see below.
+
+### Turning the CLAUDE.md link off
+
+If Claude Code already reads your `AGENTS.md`, or you just don't want the link in
+the tree, opt out with `--no-claude-link`:
+
+```bash
+npx skills-syncer --no-claude-link            # this repo
+npx skills-syncer --all --no-claude-link      # every repo under the folder
+```
+
+It skips creating the link and removes one this tool made. A real `CLAUDE.md`, or
+a symlink pointing anywhere other than `AGENTS.md`, is the repo's own and stays.
+
+The choice is recorded as `"claudeLink": false` in `skills-syncer.json`, so plain
+re-syncs — including `--all`, which reads each repo's own config — keep honouring
+it without repeating the flag. `--claude-link` opts back in and drops the key.
+Unlike `--from`/`--skill`/`--agent`, these two flags are *not* ignored by `--all`:
+they override every repo's recorded value, so a fleet flips in one run.
 
 ### Bundled catalog (ship the tool with your catalog)
 
@@ -215,7 +237,7 @@ bundled catalog again).
 | `.claude/skills/<name>/` | each selected skill folder (real copy) |
 | `.claude/agents/<role>.md` | each selected/required agent (registered subagent) |
 | `AGENTS.md` | shared block merged in, repo notes kept below |
-| `CLAUDE.md` | symlink → `AGENTS.md` (skipped if a real `CLAUDE.md` exists) |
+| `CLAUDE.md` | symlink → `AGENTS.md` (skipped if a real `CLAUDE.md` exists; off with `--no-claude-link`) |
 | `skills-syncer.json` | your choice: source + selection (hand-editable, committed) |
 | `skills-syncer-lock.json` | generated manifest: per-item content hash |
 
@@ -229,9 +251,13 @@ fields and run a bare `npx skills-syncer` instead of retyping flags:
 {
   "from": "github:acme/our-skills",
   "skills": ["fsd-rules", "react-rules"],
-  "agents": ["worker"]
+  "agents": ["worker"],
+  "claudeLink": false
 }
 ```
+
+`claudeLink` is optional and appears only when the repo opted out of the
+`CLAUDE.md` → `AGENTS.md` link.
 
 ## Requirements
 

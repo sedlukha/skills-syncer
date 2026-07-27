@@ -18,6 +18,8 @@
 // The one exception is a same-repo symlink CLAUDE.md -> AGENTS.md, so Claude Code
 // reads the shared instructions too. Its target sits in the same repo, so it
 // still rides with git into worktrees and the sandbox (a cross-repo link would not).
+// `--no-claude-link` turns that off (and removes a link we made); the choice is
+// recorded in skills-syncer.json, so later re-syncs keep honouring it.
 //
 // The SOURCE is just a directory (local path or a github: repo) laid out as:
 //   skills/<name>/   or  .claude/skills/<name>/     (auto-detected)
@@ -55,8 +57,9 @@ import { join, resolve, relative, basename, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 /**
- * @typedef {{ from?: string, skills?: string[], agents?: string[] }} Config
+ * @typedef {{ from?: string, skills?: string[], agents?: string[], claudeLink?: boolean }} Config
  *   Hand-editable intent file (skills-syncer.json): source + literal selection.
+ *   `claudeLink: false` opts the repo out of the CLAUDE.md -> AGENTS.md symlink.
  * @typedef {Record<string, string[]>} Manifest  skill -> agents it requires
  * @typedef {{ hash: string }} SkillEntry
  * @typedef {{ hash: string, explicit: boolean, requiredBy: string[] }} AgentEntry
@@ -88,7 +91,7 @@ const SYM = { ok: COLOR ? '✓' : 'OK', fail: COLOR ? '✗' : 'XX', skip: COLOR 
 
 // Human-readable summary of what a sync touched: "36 skills · 6 agents · AGENTS.md".
 /** @param {{ nSkills: number, nAgents: number, wroteAgentsMd: boolean,
- *            claudeLink?: 'created' | 'fixed' | 'ok' | 'skipped' | null,
+ *            claudeLink?: 'created' | 'fixed' | 'ok' | 'skipped' | 'removed' | 'off' | null,
  *            removed: { skills: string[], agents: string[] } }} r @returns {string} */
 function describe(r) {
   const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`
@@ -96,6 +99,7 @@ function describe(r) {
   if (r.nAgents) parts.push(plural(r.nAgents, 'agent'))
   if (r.wroteAgentsMd) parts.push('AGENTS.md')
   if (r.claudeLink === 'created' || r.claudeLink === 'fixed') parts.push('CLAUDE.md↝AGENTS.md')
+  if (r.claudeLink === 'removed') parts.push(c.yellow('−CLAUDE.md'))
   let out = parts.join(c.dim(' · '))
   const nRemoved = r.removed.skills.length + r.removed.agents.length
   if (nRemoved) out += `  ${c.yellow(`−${nRemoved} removed`)}`
@@ -295,15 +299,16 @@ function bundledName(pkgRoot) {
 /**
  * @typedef {{ repoName: string, nSkills: number, nAgents: number,
  *             wroteAgentsMd: boolean,
- *             claudeLink: 'created' | 'fixed' | 'ok' | 'skipped' | null,
+ *             claudeLink: 'created' | 'fixed' | 'ok' | 'skipped' | 'removed' | 'off' | null,
  *             sourceId: string,
  *             removed: { skills: string[], agents: string[] } }} SyncResult
  * @param {{ cwd: string, from?: string, skills: string[], agents: string[],
- *           dryRun: boolean, catalog?: Catalog, quiet?: boolean }} o
+ *           claudeLink?: boolean, dryRun: boolean, catalog?: Catalog, quiet?: boolean }} o
  * @returns {SyncResult}
  */
 function sync(o) {
   const { cwd, skills, agents, dryRun, quiet } = o
+  const wantClaudeLink = o.claudeLink !== false
   const cat = o.catalog || resolveCatalog(o.from)
   try {
     const root = cat.root
@@ -433,12 +438,21 @@ function sync(o) {
 
     // --- shared AGENTS.md block + persisted state -----------------------------
     const wroteAgentsMd = syncAgentsMd(cwd, srcAgentsMd, dryRun)
-    // Mirror AGENTS.md as CLAUDE.md via a symlink so Claude Code picks it up too.
-    const claudeLink = wroteAgentsMd ? syncClaudeMdLink(cwd, dryRun) : null
+    // Mirror AGENTS.md as CLAUDE.md via a symlink so Claude Code picks it up too —
+    // unless this repo opted out, in which case a link we made is taken back out.
+    let claudeLink = null
+    if (!wantClaudeLink) claudeLink = dropClaudeMdLink(cwd, dryRun)
+    else if (wroteAgentsMd) claudeLink = syncClaudeMdLink(cwd, dryRun)
     if (!dryRun) {
       // A bundled catalog has no stable `from` to record (its path is an
       // ephemeral npx checkout); the intent keeps only the selection.
-      const intent = cat.bundled ? { skills, agents } : { from: o.from, skills, agents }
+      // `claudeLink` is recorded only when off, so the opt-out survives re-syncs.
+      const intent = {
+        ...(cat.bundled ? {} : { from: o.from }),
+        skills,
+        agents,
+        ...(wantClaudeLink ? {} : { claudeLink: false }),
+      }
       writeJsonStable(join(cwd, 'skills-syncer.json'), intent)
       writeJsonStable(join(cwd, 'skills-syncer-lock.json'), lock)
     }
@@ -477,7 +491,9 @@ function sync(o) {
 // Re-sync every immediate subfolder of `root` that has a skills-syncer.json,
 // each from its OWN recorded source + selection. Repos are grouped by source so
 // a shared catalog is fetched once, not once per repo.
-/** @param {{ root: string, dryRun: boolean }} o @returns {number} exit code */
+// `claudeLink`, when given, overrides every repo's recorded value — that is how a
+// whole fleet opts in or out of the CLAUDE.md link in one run.
+/** @param {{ root: string, dryRun: boolean, claudeLink?: boolean }} o @returns {number} exit code */
 function runAll(o) {
   const { root, dryRun } = o
   const dirs = readdirSync(root, { withFileTypes: true }).filter((e) => e.isDirectory())
@@ -523,7 +539,9 @@ function runAll(o) {
         try {
           const r = sync({
             cwd: join(root, name), from: grp.from,
-            skills: cfg.skills || [], agents: cfg.agents || [], dryRun, catalog, quiet: true,
+            skills: cfg.skills || [], agents: cfg.agents || [],
+            claudeLink: o.claudeLink ?? cfg.claudeLink,
+            dryRun, catalog, quiet: true,
           })
           console.log(`    ${c.green(SYM.ok)} ${c.bold(name.padEnd(pad))}  ${describe(r)}`)
           ok.push(name)
@@ -627,6 +645,24 @@ function syncClaudeMdLink(cwd, dryRun) {
   return 'skipped'
 }
 
+// The opt-out (`--no-claude-link` / `"claudeLink": false`): never create the
+// link, and take back one this tool made — but only that one. A real CLAUDE.md,
+// or a symlink pointing somewhere else, is the repo's own and stays.
+/** @param {string} cwd @param {boolean} dryRun
+ *  @returns {'removed' | 'off'} */
+function dropClaudeMdLink(cwd, dryRun) {
+  const dest = join(cwd, 'CLAUDE.md')
+  let state
+  try {
+    state = lstatSync(dest)
+  } catch {
+    return 'off'
+  }
+  if (!state.isSymbolicLink() || readlinkSync(dest) !== 'AGENTS.md') return 'off'
+  if (!dryRun) unlinkSync(dest)
+  return 'removed'
+}
+
 // --- CLI entry --------------------------------------------------------------
 const HELP = `skills-syncer — vendor Claude Code skills + agents from a catalog into your repo
 
@@ -643,6 +679,10 @@ Options:
   --all             re-sync every immediate subfolder that has a
                     skills-syncer.json (each from its own recorded source)
   --root <dir>      with --all, the folder to scan (default: current dir)
+  --no-claude-link  don't link CLAUDE.md → AGENTS.md; remove one this tool
+                    made. Recorded in skills-syncer.json, so later re-syncs
+                    (including --all) keep the repo opted out
+  --claude-link     opt back in: link CLAUDE.md → AGENTS.md again
   --dry-run, -n     show what would change; write nothing
   --help, -h        show this help
   --version, -v     print the version
@@ -656,6 +696,8 @@ const KNOWN_FLAGS = new Set([
   ...VALUE_FLAGS,
   ...LIST_FLAGS,
   '--all',
+  '--claude-link',
+  '--no-claude-link',
   '--dry-run',
   '-n',
   '--help',
@@ -689,6 +731,12 @@ function main() {
   try {
     validateArgs(argv)
     const dryRun = argv.includes('--dry-run') || argv.includes('-n')
+    // Unlike the selection flags, this one DOES apply to --all: it overrides each
+    // repo's recorded value, so a fleet can be flipped in one run.
+    if (argv.includes('--claude-link') && argv.includes('--no-claude-link'))
+      fail('--claude-link and --no-claude-link contradict each other. Pass one.')
+    /** @type {boolean | undefined} */
+    const claudeLinkArg = argv.includes('--no-claude-link') ? false : argv.includes('--claude-link') ? true : undefined
 
     if (argv.includes('--all')) {
       for (const f of ['--from', '--skill', '--agent'])
@@ -697,7 +745,7 @@ function main() {
       const rootArg = parseValueArg(argv, '--root')
       const root = rootArg ? resolve(rootArg) : process.cwd()
       if (!existsSync(root)) fail(`--root path does not exist: ${root}`)
-      process.exitCode = runAll({ root, dryRun })
+      process.exitCode = runAll({ root, dryRun, claudeLink: claudeLinkArg })
       return
     }
     if (argv.includes('--root')) console.warn('[skills-syncer] --root has no effect without --all')
@@ -710,7 +758,8 @@ function main() {
     const argAgents = parseListArg(argv, '--agent')
     const skills = argSkills?.length ? argSkills : config.skills || []
     const agents = argAgents?.length ? argAgents : config.agents || []
-    sync({ cwd, from: from || undefined, skills, agents, dryRun })
+    const claudeLink = claudeLinkArg ?? config.claudeLink
+    sync({ cwd, from: from || undefined, skills, agents, claudeLink, dryRun })
   } catch (err) {
     if (err instanceof SyncError) {
       console.error(`[skills-syncer] ${err.message}`)
