@@ -473,6 +473,43 @@ test('--claude-link and --no-claude-link together fail', () => {
   assert.match(r.stderr, /contradict/)
 })
 
+// --- JSON formatting -------------------------------------------------------
+// The written files must already look like prettier/biome output. A repo runs
+// its own formatter over them, and a re-sync must not fight it.
+
+test('a short array stays on one line, objects still break', () => {
+  const repo = newRepo()
+  const r = run(repo, ['--from', CATALOG, '--skill', 'review-flow'])
+  assert.equal(r.status, 0, r.stderr)
+
+  const cfg = read(repo, 'skills-syncer.json')
+  assert.match(cfg, /^ {2}"skills": \["review-flow"\],$/m, 'skills on one line')
+  assert.match(cfg, /^ {2}"agents": \[\],?$/m, 'empty array stays []')
+
+  const lk = read(repo, 'skills-syncer-lock.json')
+  assert.match(lk, /^ {6}"requiredBy": \["review-flow"\]$/m, 'requiredBy on one line')
+  assert.match(lk, /^ {2}"skills": \{$/m, 'objects still break, one key per line')
+  assert.match(lk, /^ {4}"review-flow": \{$/m)
+})
+
+test('an array too long for the print width breaks one item per line', () => {
+  // Long names, so the flat array cannot fit in 80 columns.
+  const catalog = mkdtempSync(join(tmpdir(), 'sst-wide-'))
+  const names = ['alpha-very-long-rules', 'bravo-very-long-rules', 'charlie-very-long-rules']
+  for (const n of names) {
+    mkdirSync(join(catalog, 'skills', n), { recursive: true })
+    writeFileSync(join(catalog, 'skills', n, 'SKILL.md'), `${n}\n`)
+  }
+  const repo = newRepo()
+  const r = run(repo, ['--from', catalog, '--skill', ...names])
+  assert.equal(r.status, 0, r.stderr)
+
+  const cfg = read(repo, 'skills-syncer.json')
+  assert.match(cfg, /^ {2}"skills": \[$/m, 'array breaks')
+  for (const n of names) assert.match(cfg, new RegExp(`^ {4}"${n}",?$`, 'm'), `${n} on its own line`)
+  for (const line of cfg.split('\n')) assert.ok(line.length <= 80, `line fits 80 cols: ${line}`)
+})
+
 test('--all --no-claude-link opts every repo out at once', () => {
   const root = mkdtempSync(join(tmpdir(), 'sst-root-'))
   for (const name of ['a', 'b']) {

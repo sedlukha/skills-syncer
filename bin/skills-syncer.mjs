@@ -225,6 +225,43 @@ function readJson(p) {
     return null
   }
 }
+// Pretty-print JSON the way prettier and biome do it: two-space indent, one key
+// per line, and an array kept on ONE line while it fits the print width. Repos
+// run their own formatter over these files, so matching that shape here is what
+// keeps a formatter and a re-sync from rewriting each other's whitespace.
+// Objects always break, which is also what those formatters keep.
+const PRINT_WIDTH = 80
+
+/** @param {any} v @param {number} col where the value starts on its first line
+ *  @param {number} indent indent of the value's own closing bracket
+ *  @param {number} tail chars printed after the value on its last line (a comma)
+ *  @returns {string} */
+function formatJson(v, col, indent, tail) {
+  const inner = ' '.repeat(indent + 2)
+  const pad = ' '.repeat(indent)
+  if (Array.isArray(v)) {
+    if (!v.length) return '[]'
+    // Try one line first. Nested breaks make it impossible, so bail on any \n.
+    const flat = v.map((item) => formatJson(item, 0, 0, 0))
+    const oneLine = `[${flat.join(', ')}]`
+    if (!oneLine.includes('\n') && col + oneLine.length + tail <= PRINT_WIDTH) return oneLine
+    const items = v.map((item, i) =>
+      inner + formatJson(item, inner.length, indent + 2, i === v.length - 1 ? 0 : 1),
+    )
+    return `[\n${items.join(',\n')}\n${pad}]`
+  }
+  if (v && typeof v === 'object') {
+    const keys = Object.keys(v).filter((k) => v[k] !== undefined)
+    if (!keys.length) return '{}'
+    const entries = keys.map((k, i) => {
+      const head = `${inner}${JSON.stringify(k)}: `
+      return head + formatJson(v[k], head.length, indent + 2, i === keys.length - 1 ? 0 : 1)
+    })
+    return `{\n${entries.join(',\n')}\n${pad}}`
+  }
+  return JSON.stringify(v)
+}
+
 // Write pretty JSON, but leave the file untouched if it already holds the same
 // data. Keeps a re-sync a true no-op even when an external formatter (e.g. a
 // repo's biome/prettier hook) rewrote the whitespace — no spurious git churn.
@@ -238,7 +275,7 @@ function writeJsonStable(p, obj) {
       /* unreadable/!json — fall through and overwrite */
     }
   }
-  writeFileSync(p, `${JSON.stringify(obj, null, 2)}\n`)
+  writeFileSync(p, `${formatJson(obj, 0, 0, 0)}\n`)
 }
 
 // Atomically replace a directory: copy into a sibling temp first, so a failed

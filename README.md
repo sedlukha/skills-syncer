@@ -244,6 +244,13 @@ bundled catalog again).
 A re-sync replaces only what the lock installed and removes what you dropped from
 the selection — it never touches a repo-authored skill or agent.
 
+Both JSON files are written the way prettier and biome print them: two-space
+indent, one key per line, and a short array kept on one line while it fits 80
+columns. A repo formatter therefore has nothing to fix, and a re-sync has no
+formatting to undo. Should a formatter still differ (a repo that indents with
+tabs, say), it wins: the tool rewrites a file only when the **data** changes,
+never to restyle it.
+
 `skills-syncer.json` is hand-editable — change the `from`, `skills`, or `agents`
 fields and run a bare `npx skills-syncer` instead of retyping flags:
 
