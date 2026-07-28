@@ -18,8 +18,9 @@
 // The one exception is a same-repo symlink CLAUDE.md -> AGENTS.md, so Claude Code
 // reads the shared instructions too. Its target sits in the same repo, so it
 // still rides with git into worktrees and the sandbox (a cross-repo link would not).
-// `--no-claude-link` turns that off (and removes a link we made); the choice is
-// recorded in skills-syncer.json, so later re-syncs keep honouring it.
+// `--claude-import` writes a real CLAUDE.md holding `@AGENTS.md` instead, for
+// hosts that do not follow symlinks; `--no-claude-link` writes no CLAUDE.md at
+// all. Either choice is recorded in skills-syncer.json, so later re-syncs keep it.
 //
 // The SOURCE is just a directory (local path or a github: repo) laid out as:
 //   skills/<name>/   or  .claude/skills/<name>/     (auto-detected)
@@ -57,9 +58,12 @@ import { join, resolve, relative, basename, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 /**
- * @typedef {{ from?: string, skills?: string[], agents?: string[], claudeLink?: boolean }} Config
+ * @typedef {boolean | 'symlink' | 'import'} ClaudeLink
+ *   How CLAUDE.md points at AGENTS.md: a symlink (default), an `@AGENTS.md`
+ *   import inside a real file, or nothing at all (`false`).
+ * @typedef {{ from?: string, skills?: string[], agents?: string[], claudeLink?: ClaudeLink }} Config
  *   Hand-editable intent file (skills-syncer.json): source + literal selection.
- *   `claudeLink: false` opts the repo out of the CLAUDE.md -> AGENTS.md symlink.
+ *   `claudeLink` records a non-default CLAUDE.md choice (`false` or `"import"`).
  * @typedef {Record<string, string[]>} Manifest  skill -> agents it requires
  * @typedef {{ hash: string }} SkillEntry
  * @typedef {{ hash: string, explicit: boolean, requiredBy: string[] }} AgentEntry
@@ -92,13 +96,15 @@ const SYM = { ok: COLOR ? '✓' : 'OK', fail: COLOR ? '✗' : 'XX', skip: COLOR 
 // Human-readable summary of what a sync touched: "36 skills · 6 agents · AGENTS.md".
 /** @param {{ nSkills: number, nAgents: number, wroteAgentsMd: boolean,
  *            claudeLink?: 'created' | 'fixed' | 'ok' | 'skipped' | 'removed' | 'off' | null,
+ *            claudeMode?: 'symlink' | 'import' | 'off',
  *            removed: { skills: string[], agents: string[] } }} r @returns {string} */
 function describe(r) {
   const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`
   const parts = [plural(r.nSkills, 'skill')]
   if (r.nAgents) parts.push(plural(r.nAgents, 'agent'))
   if (r.wroteAgentsMd) parts.push('AGENTS.md')
-  if (r.claudeLink === 'created' || r.claudeLink === 'fixed') parts.push('CLAUDE.md↝AGENTS.md')
+  if (r.claudeLink === 'created' || r.claudeLink === 'fixed')
+    parts.push(r.claudeMode === 'import' ? 'CLAUDE.md↝@AGENTS.md' : 'CLAUDE.md↝AGENTS.md')
   if (r.claudeLink === 'removed') parts.push(c.yellow('−CLAUDE.md'))
   let out = parts.join(c.dim(' · '))
   const nRemoved = r.removed.skills.length + r.removed.agents.length
@@ -337,15 +343,16 @@ function bundledName(pkgRoot) {
  * @typedef {{ repoName: string, nSkills: number, nAgents: number,
  *             wroteAgentsMd: boolean,
  *             claudeLink: 'created' | 'fixed' | 'ok' | 'skipped' | 'removed' | 'off' | null,
+ *             claudeMode: 'symlink' | 'import' | 'off',
  *             sourceId: string,
  *             removed: { skills: string[], agents: string[] } }} SyncResult
  * @param {{ cwd: string, from?: string, skills: string[], agents: string[],
- *           claudeLink?: boolean, dryRun: boolean, catalog?: Catalog, quiet?: boolean }} o
+ *           claudeLink?: ClaudeLink, dryRun: boolean, catalog?: Catalog, quiet?: boolean }} o
  * @returns {SyncResult}
  */
 function sync(o) {
   const { cwd, skills, agents, dryRun, quiet } = o
-  const wantClaudeLink = o.claudeLink !== false
+  const claudeMode = claudeModeOf(o.claudeLink)
   const cat = o.catalog || resolveCatalog(o.from)
   try {
     const root = cat.root
@@ -475,20 +482,23 @@ function sync(o) {
 
     // --- shared AGENTS.md block + persisted state -----------------------------
     const wroteAgentsMd = syncAgentsMd(cwd, srcAgentsMd, dryRun)
-    // Mirror AGENTS.md as CLAUDE.md via a symlink so Claude Code picks it up too —
-    // unless this repo opted out, in which case a link we made is taken back out.
+    // Mirror AGENTS.md as CLAUDE.md so Claude Code picks it up too — as a symlink
+    // or as an `@AGENTS.md` import. When off, a link we made is taken back out.
     let claudeLink = null
-    if (!wantClaudeLink) claudeLink = dropClaudeMdLink(cwd, dryRun)
-    else if (wroteAgentsMd) claudeLink = syncClaudeMdLink(cwd, dryRun)
+    if (claudeMode === 'off') claudeLink = dropClaudeMdLink(cwd, dryRun)
+    else if (wroteAgentsMd) claudeLink = syncClaudeMd(cwd, dryRun, claudeMode)
     if (!dryRun) {
       // A bundled catalog has no stable `from` to record (its path is an
       // ephemeral npx checkout); the intent keeps only the selection.
-      // `claudeLink` is recorded only when off, so the opt-out survives re-syncs.
+      // `claudeLink` is recorded whenever it is not the default, so the choice
+      // survives a bare re-sync.
       const intent = {
         ...(cat.bundled ? {} : { from: o.from }),
         skills,
         agents,
-        ...(wantClaudeLink ? {} : { claudeLink: false }),
+        // 'symlink' is the default, so it is left out; the other two are recorded.
+        ...(claudeMode === 'off' ? { claudeLink: false } : {}),
+        ...(claudeMode === 'import' ? { claudeLink: 'import' } : {}),
       }
       writeJsonStable(join(cwd, 'skills-syncer.json'), intent)
       writeJsonStable(join(cwd, 'skills-syncer-lock.json'), lock)
@@ -502,6 +512,7 @@ function sync(o) {
       nAgents: Object.keys(lock.agents).length,
       wroteAgentsMd,
       claudeLink,
+      claudeMode,
       sourceId: cat.sourceId,
       removed,
     }
@@ -529,8 +540,8 @@ function sync(o) {
 // each from its OWN recorded source + selection. Repos are grouped by source so
 // a shared catalog is fetched once, not once per repo.
 // `claudeLink`, when given, overrides every repo's recorded value — that is how a
-// whole fleet opts in or out of the CLAUDE.md link in one run.
-/** @param {{ root: string, dryRun: boolean, claudeLink?: boolean }} o @returns {number} exit code */
+// whole fleet switches its CLAUDE.md shape in one run.
+/** @param {{ root: string, dryRun: boolean, claudeLink?: ClaudeLink }} o @returns {number} exit code */
 function runAll(o) {
   const { root, dryRun } = o
   const dirs = readdirSync(root, { withFileTypes: true }).filter((e) => e.isDirectory())
@@ -650,52 +661,79 @@ function syncAgentsMd(cwd, srcAgentsMd, dryRun) {
   return true
 }
 
-// --- CLAUDE.md → AGENTS.md symlink ------------------------------------------
+// --- CLAUDE.md → AGENTS.md ---------------------------------------------------
 // AGENTS.md is the cross-tool standard; CLAUDE.md is Claude Code's own name for
-// the same instructions. Point CLAUDE.md at AGENTS.md so both stay identical
-// with no duplicated content. The link target is a sibling in the SAME repo, so
-// it rides with git into every worktree and the Docker sandbox — unlike a
-// cross-repo symlink, it never dangles. A repo-authored real CLAUDE.md is left
-// untouched (we never clobber a real file). Idempotent.
-/** @param {string} cwd @param {boolean} dryRun
- *  @returns {'created' | 'fixed' | 'ok' | 'skipped' | null} */
-function syncClaudeMdLink(cwd, dryRun) {
-  const target = 'AGENTS.md'
-  const dest = join(cwd, 'CLAUDE.md')
+// the same instructions. Three ways to tie them together, picked per repo:
+//
+//   'symlink' (default) CLAUDE.md is a symlink to AGENTS.md
+//   'import'            CLAUDE.md is a REAL file holding `@AGENTS.md`, the
+//                       Claude Code import — a link in content, not in the
+//                       filesystem. For hosts, checkouts, or tools that do not
+//                       follow symlinks (Windows without developer mode, an
+//                       archive export, a copy step that dereferences).
+//   'off'               no CLAUDE.md at all
+//
+// Either link keeps ONE copy of the text: the target is a sibling in the SAME
+// repo, so it rides with git into every worktree and the Docker sandbox.
+const CLAUDE_IMPORT = '@AGENTS.md\n'
+
+// Config/CLI value -> the mode to apply. Anything unset means the default.
+/** @param {ClaudeLink | undefined} v @returns {'symlink' | 'import' | 'off'} */
+function claudeModeOf(v) {
+  if (v === false) return 'off'
+  if (v === 'import') return 'import'
+  return 'symlink'
+}
+
+// What sits at CLAUDE.md today. `symlink`/`import` are the two shapes this tool
+// writes; `stale-link` is a symlink pointing somewhere else (still ours to
+// repoint — a symlink named CLAUDE.md is this tool's business); `foreign` is a
+// real file or dir the repo authored, which is never touched.
+/** @param {string} dest @returns {'symlink' | 'import' | 'stale-link' | 'foreign' | 'absent'} */
+function claudeMdKind(dest) {
   let state
   try {
     state = lstatSync(dest)
   } catch {
-    if (!dryRun) symlinkSync(target, dest)
-    return 'created'
+    return 'absent'
   }
-  if (state.isSymbolicLink()) {
-    if (readlinkSync(dest) === target) return 'ok'
-    if (!dryRun) {
-      unlinkSync(dest)
-      symlinkSync(target, dest)
-    }
-    return 'fixed'
+  if (state.isSymbolicLink()) return readlinkSync(dest) === 'AGENTS.md' ? 'symlink' : 'stale-link'
+  if (!state.isFile()) return 'foreign'
+  return readFileSync(dest, 'utf8').trim() === CLAUDE_IMPORT.trim() ? 'import' : 'foreign'
+}
+
+// Put CLAUDE.md into the wanted shape. Never clobbers a repo-authored file.
+// Idempotent: a CLAUDE.md already in that shape is left alone.
+/** @param {string} cwd @param {boolean} dryRun @param {'symlink' | 'import'} mode
+ *  @returns {'created' | 'fixed' | 'ok' | 'skipped'} */
+function syncClaudeMd(cwd, dryRun, mode) {
+  const dest = join(cwd, 'CLAUDE.md')
+  const kind = claudeMdKind(dest)
+  if (kind === mode) return 'ok'
+  if (kind === 'foreign') {
+    // A real file/dir the repo authored — do not overwrite it.
+    const how = mode === 'import' ? 'write the @AGENTS.md import' : 'link CLAUDE.md → AGENTS.md'
+    console.warn(`[skills-syncer] skip CLAUDE.md symlink: ${dest} is a real file the repo authored. Remove it to let the sync ${how}.`)
+    return 'skipped'
   }
-  // A real file/dir the repo authored — do not overwrite it.
-  console.warn(`[skills-syncer] skip CLAUDE.md symlink: ${dest} is a real file, not a symlink. Remove it to link CLAUDE.md → AGENTS.md.`)
-  return 'skipped'
+  // Absent, a stale link, or the other shape (switching modes) — write ours.
+  if (!dryRun) {
+    if (kind !== 'absent') unlinkSync(dest)
+    if (mode === 'symlink') symlinkSync('AGENTS.md', dest)
+    else writeFileSync(dest, CLAUDE_IMPORT)
+  }
+  return kind === 'absent' ? 'created' : 'fixed'
 }
 
 // The opt-out (`--no-claude-link` / `"claudeLink": false`): never create the
-// link, and take back one this tool made — but only that one. A real CLAUDE.md,
-// or a symlink pointing somewhere else, is the repo's own and stays.
+// link, and take back one this tool made — but only that one. A repo-authored
+// CLAUDE.md, or a symlink pointing somewhere else, stays.
 /** @param {string} cwd @param {boolean} dryRun
  *  @returns {'removed' | 'off'} */
 function dropClaudeMdLink(cwd, dryRun) {
   const dest = join(cwd, 'CLAUDE.md')
-  let state
-  try {
-    state = lstatSync(dest)
-  } catch {
-    return 'off'
-  }
-  if (!state.isSymbolicLink() || readlinkSync(dest) !== 'AGENTS.md') return 'off'
+  const kind = claudeMdKind(dest)
+  if (kind !== 'symlink' && kind !== 'import') return 'off'
   if (!dryRun) unlinkSync(dest)
   return 'removed'
 }
@@ -719,7 +757,9 @@ Options:
   --no-claude-link  don't link CLAUDE.md → AGENTS.md; remove one this tool
                     made. Recorded in skills-syncer.json, so later re-syncs
                     (including --all) keep the repo opted out
-  --claude-link     opt back in: link CLAUDE.md → AGENTS.md again
+  --claude-link     opt back in: CLAUDE.md is a symlink to AGENTS.md (default)
+  --claude-import   CLAUDE.md is a real file holding "@AGENTS.md", the Claude
+                    Code import — same one-copy result, no symlink
   --dry-run, -n     show what would change; write nothing
   --help, -h        show this help
   --version, -v     print the version
@@ -733,6 +773,7 @@ const KNOWN_FLAGS = new Set([
   ...VALUE_FLAGS,
   ...LIST_FLAGS,
   '--all',
+  '--claude-import',
   '--claude-link',
   '--no-claude-link',
   '--dry-run',
@@ -768,12 +809,19 @@ function main() {
   try {
     validateArgs(argv)
     const dryRun = argv.includes('--dry-run') || argv.includes('-n')
-    // Unlike the selection flags, this one DOES apply to --all: it overrides each
+    // Unlike the selection flags, these DO apply to --all: they override each
     // repo's recorded value, so a fleet can be flipped in one run.
-    if (argv.includes('--claude-link') && argv.includes('--no-claude-link'))
-      fail('--claude-link and --no-claude-link contradict each other. Pass one.')
-    /** @type {boolean | undefined} */
-    const claudeLinkArg = argv.includes('--no-claude-link') ? false : argv.includes('--claude-link') ? true : undefined
+    const claudeFlags = ['--claude-link', '--claude-import', '--no-claude-link'].filter((f) => argv.includes(f))
+    if (claudeFlags.length > 1) fail(`${claudeFlags.join(' and ')} contradict each other. Pass one.`)
+    /** @type {ClaudeLink | undefined} */
+    const claudeLinkArg =
+      claudeFlags[0] === '--no-claude-link'
+        ? false
+        : claudeFlags[0] === '--claude-import'
+          ? 'import'
+          : claudeFlags[0] === '--claude-link'
+            ? 'symlink'
+            : undefined
 
     if (argv.includes('--all')) {
       for (const f of ['--from', '--skill', '--agent'])

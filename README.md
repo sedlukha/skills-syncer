@@ -159,8 +159,9 @@ npx skills-syncer --from github:acme/our-skills --skill '*' --dry-run
 | `--agent <names…>` | agents to install directly (`'*'` = all); a selected skill's required agents come automatically |
 | `--all` | re-sync every immediate subfolder that has a `skills-syncer.json` |
 | `--root <dir>` | with `--all`, the folder to scan (default: current dir) |
-| `--no-claude-link` | don't link `CLAUDE.md` → `AGENTS.md`; remove one this tool made. Recorded in `skills-syncer.json`; applies to `--all` too |
-| `--claude-link` | opt back in: link `CLAUDE.md` → `AGENTS.md` again |
+| `--no-claude-link` | write no `CLAUDE.md`; remove one this tool made. Recorded in `skills-syncer.json`; applies to `--all` too |
+| `--claude-link` | `CLAUDE.md` is a symlink to `AGENTS.md` (the default) |
+| `--claude-import` | `CLAUDE.md` is a real file holding `@AGENTS.md`, the Claude Code import |
 | `--dry-run`, `-n` | show what would change; write nothing |
 | `--help`, `-h` | show usage |
 | `--version`, `-v` | print the version |
@@ -185,30 +186,47 @@ local path — laid out like this:
   an orchestrator skill never leaves it without its agents.
 - **`AGENTS.md`** is merged into the top of the target repo's `AGENTS.md` inside
   fenced markers; repo-specific notes below the block are preserved across
-  re-syncs. Alongside it the sync links `CLAUDE.md` → `AGENTS.md` so Claude Code
-  reads the same instructions. The link target is a sibling in the same repo, so
-  it still rides with git into worktrees and sandboxes. A repo-authored real
-  `CLAUDE.md` is left untouched (remove it to opt in), and `--no-claude-link`
-  turns the link off entirely — see below.
+  re-syncs. Alongside it the sync points `CLAUDE.md` at `AGENTS.md` so Claude Code
+  reads the same instructions — a symlink by default, an `@AGENTS.md` import with
+  `--claude-import`, or nothing with `--no-claude-link`. Either way the target is
+  a sibling in the same repo, so it still rides with git into worktrees and
+  sandboxes. A repo-authored real `CLAUDE.md` is left untouched — see below.
 
-### Turning the CLAUDE.md link off
+### Choosing the CLAUDE.md shape
 
-If Claude Code already reads your `AGENTS.md`, or you just don't want the link in
-the tree, opt out with `--no-claude-link`:
+Three shapes, one flag each. All three keep a single copy of the text in
+`AGENTS.md`.
+
+| Flag | What lands at `CLAUDE.md` |
+| --- | --- |
+| *(default)* / `--claude-link` | a symlink to `AGENTS.md` |
+| `--claude-import` | a **real file** holding `@AGENTS.md` — the Claude Code import |
+| `--no-claude-link` | nothing |
 
 ```bash
-npx skills-syncer --no-claude-link            # this repo
-npx skills-syncer --all --no-claude-link      # every repo under the folder
+npx skills-syncer --claude-import             # this repo
+npx skills-syncer --all --claude-import       # every repo under the folder
 ```
 
-It skips creating the link and removes one this tool made. A real `CLAUDE.md`, or
-a symlink pointing anywhere other than `AGENTS.md`, is the repo's own and stays.
+Use `--claude-import` where a symlink does not survive: Windows without developer
+mode, an export or archive step that dereferences links, a copy that flattens
+them. The file is one line, so git treats it like any other text file:
 
-The choice is recorded as `"claudeLink": false` in `skills-syncer.json`, so plain
-re-syncs — including `--all`, which reads each repo's own config — keep honouring
-it without repeating the flag. `--claude-link` opts back in and drops the key.
-Unlike `--from`/`--skill`/`--agent`, these two flags are *not* ignored by `--all`:
-they override every repo's recorded value, so a fleet flips in one run.
+```
+@AGENTS.md
+```
+
+Switching is free — a later `--claude-link` turns the file back into a symlink,
+and `--no-claude-link` removes it. Only what this tool wrote is replaced or
+removed: a `CLAUDE.md` the repo authored is left alone, with a warning. (A
+*symlink* named `CLAUDE.md` counts as this tool's, so a stale one is repointed.)
+
+A non-default choice is recorded in `skills-syncer.json` (`"claudeLink": false`
+or `"claudeLink": "import"`), so plain re-syncs — including `--all`, which reads
+each repo's own config — keep honouring it with no flag to repeat. Unlike
+`--from`/`--skill`/`--agent`, these flags are *not* ignored by `--all`: they
+override every repo's recorded value, so a fleet flips in one run. Passing two of
+them together is an error.
 
 ### Bundled catalog (ship the tool with your catalog)
 
@@ -237,7 +255,7 @@ bundled catalog again).
 | `.claude/skills/<name>/` | each selected skill folder (real copy) |
 | `.claude/agents/<role>.md` | each selected/required agent (registered subagent) |
 | `AGENTS.md` | shared block merged in, repo notes kept below |
-| `CLAUDE.md` | symlink → `AGENTS.md` (skipped if a real `CLAUDE.md` exists; off with `--no-claude-link`) |
+| `CLAUDE.md` | symlink → `AGENTS.md`, or `@AGENTS.md` in a real file with `--claude-import`, or nothing with `--no-claude-link` (a repo-authored `CLAUDE.md` is never touched) |
 | `skills-syncer.json` | your choice: source + selection (hand-editable, committed) |
 | `skills-syncer-lock.json` | generated manifest: per-item content hash |
 
@@ -259,12 +277,13 @@ fields and run a bare `npx skills-syncer` instead of retyping flags:
   "from": "github:acme/our-skills",
   "skills": ["fsd-rules", "react-rules"],
   "agents": ["worker"],
-  "claudeLink": false
+  "claudeLink": "import"
 }
 ```
 
-`claudeLink` is optional and appears only when the repo opted out of the
-`CLAUDE.md` → `AGENTS.md` link.
+`claudeLink` is optional. It appears only when the repo picked something other
+than the default symlink: `"import"` for the `@AGENTS.md` file, or `false` for no
+`CLAUDE.md` at all.
 
 ## Requirements
 

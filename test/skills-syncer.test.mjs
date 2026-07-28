@@ -473,6 +473,87 @@ test('--claude-link and --no-claude-link together fail', () => {
   assert.match(r.stderr, /contradict/)
 })
 
+// --- CLAUDE.md as an @AGENTS.md import -------------------------------------
+
+test('--claude-import writes a real CLAUDE.md holding @AGENTS.md', () => {
+  const repo = newRepo()
+  const r = run(repo, ['--from', CATALOG, '--skill', 'hello-rules', '--claude-import'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.ok(!isLink(repo), 'a real file, not a symlink')
+  assert.equal(read(repo, 'CLAUDE.md'), '@AGENTS.md\n')
+  assert.equal(config(repo).claudeLink, 'import', 'choice recorded')
+
+  // The choice survives a bare re-sync, and the file is left alone.
+  const again = run(repo, [])
+  assert.equal(again.status, 0, again.stderr)
+  assert.equal(read(repo, 'CLAUDE.md'), '@AGENTS.md\n')
+  assert.equal(config(repo).claudeLink, 'import')
+})
+
+test('--claude-import replaces an existing symlink, and back again', () => {
+  const repo = newRepo()
+  run(repo, ['--from', CATALOG, '--skill', 'hello-rules'])
+  assert.ok(isLink(repo), 'first sync linked it')
+
+  run(repo, ['--claude-import'])
+  assert.ok(!isLink(repo), 'symlink replaced by a real file')
+  assert.equal(read(repo, 'CLAUDE.md'), '@AGENTS.md\n')
+
+  run(repo, ['--claude-link'])
+  assert.ok(isLink(repo), 'import file replaced by a symlink')
+  assert.equal(readlinkSync(join(repo, 'CLAUDE.md')), 'AGENTS.md')
+  assert.equal(config(repo).claudeLink, undefined, 'default is not recorded')
+})
+
+test('--no-claude-link removes an import file this tool wrote', () => {
+  const repo = newRepo()
+  run(repo, ['--from', CATALOG, '--skill', 'hello-rules', '--claude-import'])
+  const r = run(repo, ['--no-claude-link'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.ok(!has(repo, 'CLAUDE.md'), 'import file removed')
+  assert.equal(config(repo).claudeLink, false)
+})
+
+test('--claude-import leaves a repo-authored CLAUDE.md alone, with a warning', () => {
+  const repo = newRepo()
+  writeFileSync(join(repo, 'CLAUDE.md'), 'MY OWN FILE\n')
+  const r = run(repo, ['--from', CATALOG, '--skill', 'hello-rules', '--claude-import'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.equal(read(repo, 'CLAUDE.md'), 'MY OWN FILE\n', 'content preserved')
+  assert.match(r.stderr, /skip CLAUDE\.md/)
+})
+
+test('--claude-import --dry-run writes nothing', () => {
+  const repo = newRepo()
+  const r = run(repo, ['--from', CATALOG, '--skill', 'hello-rules', '--claude-import', '--dry-run'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.ok(!has(repo, 'CLAUDE.md'))
+})
+
+test('two contradicting CLAUDE.md flags fail', () => {
+  const repo = newRepo()
+  const r = run(repo, ['--from', CATALOG, '--skill', 'hello-rules', '--claude-import', '--no-claude-link'])
+  assert.equal(r.status, 1)
+  assert.match(r.stderr, /contradict/)
+})
+
+test('--all --claude-import switches every repo at once', () => {
+  const root = mkdtempSync(join(tmpdir(), 'sst-root-import-'))
+  for (const name of ['a', 'b']) {
+    const repo = join(root, name)
+    mkdirSync(repo)
+    run(repo, ['--from', CATALOG, '--skill', 'hello-rules'])
+    assert.ok(isLink(repo), `${name} linked by the first sync`)
+  }
+  const r = run(root, ['--all', '--claude-import'])
+  assert.equal(r.status, 0, r.stderr)
+  for (const name of ['a', 'b']) {
+    assert.ok(!isLink(join(root, name)), `${name} no longer a symlink`)
+    assert.equal(read(join(root, name), 'CLAUDE.md'), '@AGENTS.md\n')
+    assert.equal(config(join(root, name)).claudeLink, 'import')
+  }
+})
+
 // --- JSON formatting -------------------------------------------------------
 // The written files must already look like prettier/biome output. A repo runs
 // its own formatter over them, and a re-sync must not fight it.
