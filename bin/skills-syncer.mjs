@@ -12,6 +12,8 @@
 // It copies REAL files (not symlinks) into the current repo:
 //   ./.claude/skills/<name>/   <- each selected skill folder
 //   ./.claude/agents/<role>.md <- each selected/required agent
+//   ./.claude/hooks/<file>     <- every hook in the catalog (--no-hooks opts out)
+//   ./.claude/settings.json    <- the catalog's `hooks` block, merged in
 //   ./AGENTS.md                <- the catalog's shared block, merged in (if present)
 //   ./skills-syncer.json           <- your choice: source + selection (hand-editable)
 //   ./skills-syncer-lock.json      <- generated manifest: per-item content hash
@@ -25,8 +27,13 @@
 // The SOURCE is just a directory (local path or a github: repo) laid out as:
 //   skills/<name>/   or  .claude/skills/<name>/     (auto-detected)
 //   agents/<role>.md or  .claude/agents/<role>.md
+//   hooks/<file>     or  .claude/hooks/<file>       (optional) hook scripts
+//   settings.json    or  .claude/settings.json      (optional) its `hooks` block
 //   skill-agents.json   (optional) maps a skill -> [agents it needs]
 //   AGENTS.md           (optional) shared Project Instructions block
+//
+// Hooks are NOT part of the skill selection. A hook is repo-wide wiring, not a
+// document an agent loads, so every repo takes all of them or opts out entirely.
 //
 // A re-sync is incremental: an item whose content already matches the catalog is
 // left untouched (its on-disk hash equals the source hash). What it does install
@@ -61,14 +68,21 @@ import { fileURLToPath } from 'node:url'
  * @typedef {boolean | 'symlink' | 'import'} ClaudeLink
  *   How CLAUDE.md points at AGENTS.md: a symlink (default), an `@AGENTS.md`
  *   import inside a real file, or nothing at all (`false`).
- * @typedef {{ from?: string, skills?: string[], agents?: string[], claudeLink?: ClaudeLink }} Config
+ * @typedef {{ from?: string, skills?: string[], agents?: string[], claudeLink?: ClaudeLink,
+ *             hooks?: boolean }} Config
  *   Hand-editable intent file (skills-syncer.json): source + literal selection.
  *   `claudeLink` records a non-default CLAUDE.md choice (`false` or `"import"`).
+ *   `hooks: false` opts the repo out of the catalog's hooks.
  * @typedef {Record<string, string[]>} Manifest  skill -> agents it requires
  * @typedef {{ hash: string }} SkillEntry
  * @typedef {{ hash: string, explicit: boolean, requiredBy: string[] }} AgentEntry
- * @typedef {{ version: number, source: string, skills: Record<string, SkillEntry>, agents: Record<string, AgentEntry> }} Lock
+ * @typedef {{ hash: string }} HookEntry
+ * @typedef {{ version: number, source: string, skills: Record<string, SkillEntry>,
+ *             agents: Record<string, AgentEntry>, hooks: Record<string, HookEntry>,
+ *             settingsHooks: string[] }} Lock
  *   Generated manifest (skills-syncer-lock.json): per-item content hash.
+ *   `settingsHooks` lists the settings.json hook groups this tool installed, so a
+ *   later sync can take them back out without touching the repo's own hooks.
  * @typedef {{ root: string, cleanup: () => void, sourceId: string, bundled: boolean }} Catalog
  *   A resolved source: where it lives, how to clean it up, its lock label.
  */
@@ -94,20 +108,21 @@ const c = {
 const SYM = { ok: COLOR ? '✓' : 'OK', fail: COLOR ? '✗' : 'XX', skip: COLOR ? '·' : '-' }
 
 // Human-readable summary of what a sync touched: "36 skills · 6 agents · AGENTS.md".
-/** @param {{ nSkills: number, nAgents: number, wroteAgentsMd: boolean,
+/** @param {{ nSkills: number, nAgents: number, nHooks?: number, wroteAgentsMd: boolean,
  *            claudeLink?: 'created' | 'fixed' | 'ok' | 'skipped' | 'removed' | 'off' | null,
  *            claudeMode?: 'symlink' | 'import' | 'off',
- *            removed: { skills: string[], agents: string[] } }} r @returns {string} */
+ *            removed: { skills: string[], agents: string[], hooks?: string[] } }} r @returns {string} */
 function describe(r) {
   const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`
   const parts = [plural(r.nSkills, 'skill')]
   if (r.nAgents) parts.push(plural(r.nAgents, 'agent'))
+  if (r.nHooks) parts.push(plural(r.nHooks, 'hook'))
   if (r.wroteAgentsMd) parts.push('AGENTS.md')
   if (r.claudeLink === 'created' || r.claudeLink === 'fixed')
     parts.push(r.claudeMode === 'import' ? 'CLAUDE.md↝@AGENTS.md' : 'CLAUDE.md↝AGENTS.md')
   if (r.claudeLink === 'removed') parts.push(c.yellow('−CLAUDE.md'))
   let out = parts.join(c.dim(' · '))
-  const nRemoved = r.removed.skills.length + r.removed.agents.length
+  const nRemoved = r.removed.skills.length + r.removed.agents.length + (r.removed.hooks?.length || 0)
   if (nRemoved) out += `  ${c.yellow(`−${nRemoved} removed`)}`
   return out
 }
@@ -340,14 +355,15 @@ function bundledName(pkgRoot) {
 // `catalog` may be pre-resolved (the caller then owns its cleanup) — `--all`
 // uses this to fetch a shared source once and reuse it across repos.
 /**
- * @typedef {{ repoName: string, nSkills: number, nAgents: number,
+ * @typedef {{ repoName: string, nSkills: number, nAgents: number, nHooks: number,
  *             wroteAgentsMd: boolean,
  *             claudeLink: 'created' | 'fixed' | 'ok' | 'skipped' | 'removed' | 'off' | null,
  *             claudeMode: 'symlink' | 'import' | 'off',
  *             sourceId: string,
- *             removed: { skills: string[], agents: string[] } }} SyncResult
+ *             removed: { skills: string[], agents: string[], hooks: string[] } }} SyncResult
  * @param {{ cwd: string, from?: string, skills: string[], agents: string[],
- *           claudeLink?: ClaudeLink, dryRun: boolean, catalog?: Catalog, quiet?: boolean }} o
+ *           claudeLink?: ClaudeLink, hooks?: boolean, dryRun: boolean,
+ *           catalog?: Catalog, quiet?: boolean }} o
  * @returns {SyncResult}
  */
 function sync(o) {
@@ -360,8 +376,13 @@ function sync(o) {
 
     const srcSkillsDir = pick(root, ['skills'], ['.claude', 'skills'])
     const srcAgentsDir = pick(root, ['agents'], ['.claude', 'agents'])
+    const srcHooksDir = pick(root, ['hooks'], ['.claude', 'hooks'])
+    const srcSettings = pick(root, ['settings.json'], ['.claude', 'settings.json'])
     const srcAgentsMd = join(root, 'AGENTS.md')
     const manifestPath = join(root, 'skill-agents.json')
+    // Hooks ride with the catalog, not with a per-skill selection: a hook is
+    // repo-wide wiring, not a document an agent loads. A repo opts out instead.
+    const hooksOn = o.hooks !== false
 
     const availableSkills = listDirs(srcSkillsDir)
     const availableAgents = listAgents(srcAgentsDir)
@@ -413,7 +434,7 @@ function sync(o) {
     /** @type {Lock | null} */
     const prevLock = readJson(join(cwd, 'skills-syncer-lock.json'))
     /** @type {Lock} */
-    const lock = { version: 1, source: cat.sourceId, skills: {}, agents: {} }
+    const lock = { version: 1, source: cat.sourceId, skills: {}, agents: {}, hooks: {}, settingsHooks: [] }
 
     // --- install skills (incremental + atomic) --------------------------------
     for (const name of [...skillSel].sort()) {
@@ -459,9 +480,37 @@ function sync(o) {
       }
     }
 
+    // --- install hook scripts -------------------------------------------------
+    const hooksDest = join(cwd, '.claude', 'hooks')
+    for (const rel of hooksOn ? walkRel(srcHooksDir) : []) {
+      const srcFile = join(srcHooksDir, rel)
+      const dest = join(hooksDest, rel)
+      const prev = prevLock?.hooks?.[rel]
+      const exists = existsSync(dest)
+      if (exists && !prev) {
+        console.warn(`[skills-syncer] skip hook "${rel}": .claude/hooks/${rel} exists but is not managed by skills-syncer (repo-authored). Remove it to vendor this hook.`)
+        continue
+      }
+      const srcHash = fileHash(srcFile)
+      const destHash = exists ? fileHash(dest) : null
+      if (prev && destHash !== null && destHash !== prev.hash) {
+        console.warn(`[skills-syncer] hook "${rel}" was edited locally since last sync — ${dryRun ? 'would overwrite' : 'overwriting'}. Make the change in the source catalog instead.`)
+      }
+      if (destHash !== srcHash && !dryRun) installFile(srcFile, dest)
+      lock.hooks[rel] = { hash: srcHash }
+    }
+
     // --- cleanup: drop what is no longer selected -----------------------------
-    /** @type {{ skills: string[], agents: string[] }} */
-    const removed = { skills: [], agents: [] }
+    /** @type {{ skills: string[], agents: string[], hooks: string[] }} */
+    const removed = { skills: [], agents: [], hooks: [] }
+    for (const rel of prevLock?.hooks ? Object.keys(prevLock.hooks) : []) {
+      if (lock.hooks[rel]) continue
+      const dest = join(hooksDest, rel)
+      if (existsSync(dest)) {
+        if (!dryRun) rmSync(dest, { force: true })
+        removed.hooks.push(rel)
+      }
+    }
     for (const name of prevLock?.skills ? Object.keys(prevLock.skills) : []) {
       if (lock.skills[name]) continue
       const dest = join(skillsDest, name)
@@ -479,6 +528,14 @@ function sync(o) {
         removed.agents.push(role)
       }
     }
+
+    // --- wire the hooks into .claude/settings.json ----------------------------
+    lock.settingsHooks = syncSettingsHooks(
+      cwd,
+      hooksOn ? srcSettings : null,
+      prevLock?.settingsHooks || [],
+      dryRun,
+    )
 
     // --- shared AGENTS.md block + persisted state -----------------------------
     const wroteAgentsMd = syncAgentsMd(cwd, srcAgentsMd, dryRun)
@@ -499,6 +556,8 @@ function sync(o) {
         // 'symlink' is the default, so it is left out; the other two are recorded.
         ...(claudeMode === 'off' ? { claudeLink: false } : {}),
         ...(claudeMode === 'import' ? { claudeLink: 'import' } : {}),
+        // Hooks are on by default, so only the opt-out is recorded.
+        ...(hooksOn ? {} : { hooks: false }),
       }
       writeJsonStable(join(cwd, 'skills-syncer.json'), intent)
       writeJsonStable(join(cwd, 'skills-syncer-lock.json'), lock)
@@ -510,6 +569,7 @@ function sync(o) {
       repoName: basename(cwd),
       nSkills: Object.keys(lock.skills).length,
       nAgents: Object.keys(lock.agents).length,
+      nHooks: Object.keys(lock.hooks).length,
       wroteAgentsMd,
       claudeLink,
       claudeMode,
@@ -527,6 +587,7 @@ function sync(o) {
       const rverb = dryRun ? 'would remove' : 'removed'
       if (removed.skills.length) console.log(`  ${c.yellow(`${rverb} skills:`)} ${removed.skills.join(', ')}`)
       if (removed.agents.length) console.log(`  ${c.yellow(`${rverb} agents:`)} ${removed.agents.join(', ')}`)
+      if (removed.hooks.length) console.log(`  ${c.yellow(`${rverb} hooks:`)} ${removed.hooks.join(', ')}`)
       if (dryRun) console.log(c.dim('dry run — nothing written. Re-run without --dry-run to apply.'))
     }
     return result
@@ -541,7 +602,8 @@ function sync(o) {
 // a shared catalog is fetched once, not once per repo.
 // `claudeLink`, when given, overrides every repo's recorded value — that is how a
 // whole fleet switches its CLAUDE.md shape in one run.
-/** @param {{ root: string, dryRun: boolean, claudeLink?: ClaudeLink }} o @returns {number} exit code */
+/** @param {{ root: string, dryRun: boolean, claudeLink?: ClaudeLink, hooks?: boolean }} o
+ *  @returns {number} exit code */
 function runAll(o) {
   const { root, dryRun } = o
   const dirs = readdirSync(root, { withFileTypes: true }).filter((e) => e.isDirectory())
@@ -589,6 +651,7 @@ function runAll(o) {
             cwd: join(root, name), from: grp.from,
             skills: cfg.skills || [], agents: cfg.agents || [],
             claudeLink: o.claudeLink ?? cfg.claudeLink,
+            hooks: o.hooks ?? cfg.hooks,
             dryRun, catalog, quiet: true,
           })
           console.log(`    ${c.green(SYM.ok)} ${c.bold(name.padEnd(pad))}  ${describe(r)}`)
@@ -623,6 +686,63 @@ function tryResolve(from) {
     console.error(`[skills-syncer] ${err.message}`)
     return null
   }
+}
+
+// --- .claude/settings.json hooks merge ---------------------------------------
+// A hook script is dead weight until settings.json points at it. The catalog
+// owns that wiring in its own settings.json; we merge ONLY its `hooks` block.
+//
+// We record every group we install in the lock. A later sync takes those exact
+// groups back out before it adds the new ones. So the repo's own hooks survive,
+// and a hook dropped from the catalog is dropped from the repo too.
+//
+// `srcSettings` is null when the repo opted out; then we only remove ours.
+/** @param {string} cwd @param {string | null} srcSettings @param {string[]} prevOwned
+ *  @param {boolean} dryRun @returns {string[]} the groups we own after this run */
+function syncSettingsHooks(cwd, srcSettings, prevOwned, dryRun) {
+  const src = srcSettings && existsSync(srcSettings) ? readJson(srcSettings) : null
+  const srcHooks = (src && src.hooks) || {}
+  const dest = join(cwd, '.claude', 'settings.json')
+  const cur = readJson(dest)
+  if (!cur && !Object.keys(srcHooks).length) return []
+
+  const owned = new Set(prevOwned)
+  /** @param {string} event @param {any} group @returns {string} */
+  const idOf = (event, group) => `${event} ${JSON.stringify(group)}`
+
+  // Keep what the repo wrote. Drop what we installed last time.
+  /** @type {Record<string, any[]>} */
+  const next = {}
+  for (const [event, groups] of Object.entries((cur && cur.hooks) || {})) {
+    const kept = (Array.isArray(groups) ? groups : []).filter((g) => !owned.has(idOf(event, g)))
+    if (kept.length) next[event] = kept
+  }
+
+  /** @type {string[]} */
+  const nowOwned = []
+  for (const [event, groups] of Object.entries(srcHooks)) {
+    for (const g of Array.isArray(groups) ? groups : []) {
+      if (!next[event]) next[event] = []
+      const same = JSON.stringify(g)
+      if (!next[event].some((x) => JSON.stringify(x) === same)) next[event].push(g)
+      nowOwned.push(idOf(event, g))
+    }
+  }
+
+  const merged = { ...(cur || {}) }
+  if (Object.keys(next).length) merged.hooks = next
+  else delete merged.hooks
+
+  if (!dryRun) {
+    if (Object.keys(merged).length) {
+      mkdirSync(dirname(dest), { recursive: true })
+      writeJsonStable(dest, merged)
+    } else if (existsSync(dest)) {
+      // We created it and we are the last thing in it — leave no empty file.
+      rmSync(dest, { force: true })
+    }
+  }
+  return nowOwned
 }
 
 // --- AGENTS.md merge --------------------------------------------------------
@@ -760,12 +880,20 @@ Options:
   --claude-link     opt back in: CLAUDE.md is a symlink to AGENTS.md (default)
   --claude-import   CLAUDE.md is a real file holding "@AGENTS.md", the Claude
                     Code import — same one-copy result, no symlink
+  --no-hooks        don't vendor the catalog's hooks; remove ones this tool
+                    installed. Recorded in skills-syncer.json, so later
+                    re-syncs (including --all) keep the repo opted out
+  --hooks           opt back in (default)
   --dry-run, -n     show what would change; write nothing
   --help, -h        show this help
   --version, -v     print the version
 
-Writes .claude/skills/, .claude/agents/, AGENTS.md, skills-syncer.json and
-skills-syncer-lock.json into the current repo. Commit the result.`
+Writes .claude/skills/, .claude/agents/, .claude/hooks/, the hooks block of
+.claude/settings.json, AGENTS.md, skills-syncer.json and skills-syncer-lock.json
+into the current repo. Commit the result.
+
+Hooks follow the catalog, not the skill selection: a hook is repo-wide wiring,
+so every repo gets all of them, or none via --no-hooks.`
 
 const VALUE_FLAGS = new Set(['--from', '--root']) // take exactly one value
 const LIST_FLAGS = new Set(['--skill', '--agent']) // take a list until the next flag
@@ -776,6 +904,8 @@ const KNOWN_FLAGS = new Set([
   '--claude-import',
   '--claude-link',
   '--no-claude-link',
+  '--hooks',
+  '--no-hooks',
   '--dry-run',
   '-n',
   '--help',
@@ -823,6 +953,11 @@ function main() {
             ? 'symlink'
             : undefined
 
+    const hookFlags = ['--hooks', '--no-hooks'].filter((f) => argv.includes(f))
+    if (hookFlags.length > 1) fail(`${hookFlags.join(' and ')} contradict each other. Pass one.`)
+    /** @type {boolean | undefined} */
+    const hooksArg = hookFlags[0] === '--no-hooks' ? false : hookFlags[0] === '--hooks' ? true : undefined
+
     if (argv.includes('--all')) {
       for (const f of ['--from', '--skill', '--agent'])
         if (argv.includes(f))
@@ -830,7 +965,7 @@ function main() {
       const rootArg = parseValueArg(argv, '--root')
       const root = rootArg ? resolve(rootArg) : process.cwd()
       if (!existsSync(root)) fail(`--root path does not exist: ${root}`)
-      process.exitCode = runAll({ root, dryRun, claudeLink: claudeLinkArg })
+      process.exitCode = runAll({ root, dryRun, claudeLink: claudeLinkArg, hooks: hooksArg })
       return
     }
     if (argv.includes('--root')) console.warn('[skills-syncer] --root has no effect without --all')
@@ -844,7 +979,8 @@ function main() {
     const skills = argSkills?.length ? argSkills : config.skills || []
     const agents = argAgents?.length ? argAgents : config.agents || []
     const claudeLink = claudeLinkArg ?? config.claudeLink
-    sync({ cwd, from: from || undefined, skills, agents, claudeLink, dryRun })
+    const hooks = hooksArg ?? config.hooks
+    sync({ cwd, from: from || undefined, skills, agents, claudeLink, hooks, dryRun })
   } catch (err) {
     if (err instanceof SyncError) {
       console.error(`[skills-syncer] ${err.message}`)

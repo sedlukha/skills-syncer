@@ -162,6 +162,8 @@ npx skills-syncer --from github:acme/our-skills --skill '*' --dry-run
 | `--no-claude-link` | write no `CLAUDE.md`; remove one this tool made. Recorded in `skills-syncer.json`; applies to `--all` too |
 | `--claude-link` | `CLAUDE.md` is a symlink to `AGENTS.md` (the default) |
 | `--claude-import` | `CLAUDE.md` is a real file holding `@AGENTS.md`, the Claude Code import |
+| `--no-hooks` | vendor no hooks; remove ones this tool installed. Recorded in `skills-syncer.json`; applies to `--all` too |
+| `--hooks` | vendor the catalog's hooks (the default) |
 | `--dry-run`, `-n` | show what would change; write nothing |
 | `--help`, `-h` | show usage |
 | `--version`, `-v` | print the version |
@@ -177,10 +179,16 @@ local path — laid out like this:
 <catalog>/
   skills/<name>/SKILL.md ...     # or .claude/skills/<name>/  (auto-detected)
   agents/<role>.md               # or .claude/agents/<role>.md
+  hooks/<file>                   # or .claude/hooks/  (optional) hook scripts
+  settings.json                  # or .claude/settings.json  (optional) hook wiring
   skill-agents.json              # optional: { "<skill>": ["<agent>", ...] }
   AGENTS.md                      # optional: shared instructions block
 ```
 
+- **Hooks are not part of the selection.** A skill is a document an agent loads;
+  a hook is repo-wide wiring that runs whether an agent asks for it or not. So
+  every repo takes all of the catalog's hooks, or none of them with
+  `--no-hooks`. See [Hooks](#hooks) below.
 - **Skills and agents are two catalogs.** An agent installs when it is named with
   `--agent`, or required by a selected skill via `skill-agents.json`. So selecting
   an orchestrator skill never leaves it without its agents.
@@ -254,6 +262,8 @@ bundled catalog again).
 | --- | --- |
 | `.claude/skills/<name>/` | each selected skill folder (real copy) |
 | `.claude/agents/<role>.md` | each selected/required agent (registered subagent) |
+| `.claude/hooks/<file>` | every hook script in the catalog (real copy) |
+| `.claude/settings.json` | the catalog's `hooks` block, merged in; every other key is left alone |
 | `AGENTS.md` | shared block merged in, repo notes kept below |
 | `CLAUDE.md` | symlink → `AGENTS.md`, or `@AGENTS.md` in a real file with `--claude-import`, or nothing with `--no-claude-link` (a repo-authored `CLAUDE.md` is never touched) |
 | `skills-syncer.json` | your choice: source + selection (hand-editable, committed) |
@@ -284,6 +294,48 @@ fields and run a bare `npx skills-syncer` instead of retyping flags:
 `claudeLink` is optional. It appears only when the repo picked something other
 than the default symlink: `"import"` for the `@AGENTS.md` file, or `false` for no
 `CLAUDE.md` at all.
+
+## Hooks
+
+A skill is a document an agent chooses to load. A hook is different. It runs on
+an event, whether an agent asks for it or not, and it only runs when
+`.claude/settings.json` points at it. So the catalog ships both halves:
+
+```
+<catalog>/
+  hooks/language-check.mjs     # the script
+  settings.json                # { "hooks": { "Stop": [ ... ] } }
+```
+
+The sync copies every file under `hooks/` into the repo, and merges only the
+`hooks` block of `settings.json`. Every other key in the repo settings is left
+alone. Use `$CLAUDE_PROJECT_DIR` in a command so the path works in any repo:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/language-check.mjs\"" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The lock records each hook group the tool installed. A later sync takes those
+exact groups back out before it writes the new ones. So:
+
+- A hook you add to the repo by hand is never removed.
+- A hook dropped from the catalog is dropped from the repo.
+- A changed command replaces the old one instead of piling up next to it.
+- A hook file the repo authored is never overwritten. The tool warns and skips it.
+
+A repo opts out with `--no-hooks`, which is recorded as `"hooks": false` in
+`skills-syncer.json`. Opting out also removes the hooks the tool installed
+earlier, and deletes `.claude/settings.json` when nothing else is left in it.
 
 ## Requirements
 

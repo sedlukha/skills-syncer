@@ -606,3 +606,197 @@ test('--all --no-claude-link opts every repo out at once', () => {
     assert.equal(config(join(root, name)).claudeLink, false, `${name} opt-out recorded`)
   }
 })
+
+// --- hooks -----------------------------------------------------------------
+// Hooks ride with the catalog, not the skill selection, so they get their own
+// fixture: a hook script plus the settings.json block that wires it up.
+
+/** @param {{ settings?: any, hook?: string, second?: boolean }} [o] @returns {string} */
+function hookCatalog(o = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'sst-hookcat-'))
+  /** @param {string} rel @param {string} body */
+  const w = (rel, body) => {
+    const p = join(root, rel)
+    mkdirSync(dirname(p), { recursive: true })
+    writeFileSync(p, body)
+  }
+  w('skills/hello-rules/SKILL.md', 'HELLO v1\n')
+  w('hooks/check.mjs', o.hook ?? 'CHECK v1\n')
+  if (o.second) w('hooks/nested/extra.sh', 'EXTRA v1\n')
+  w(
+    'settings.json',
+    JSON.stringify(
+      o.settings ?? {
+        hooks: { Stop: [{ hooks: [{ type: 'command', command: 'node check.mjs' }] }] },
+      },
+    ),
+  )
+  return root
+}
+/** @param {string} repo @returns {any} */
+const settings = (repo) => JSON.parse(read(repo, '.claude', 'settings.json'))
+
+test('hooks are vendored and wired into .claude/settings.json', () => {
+  const repo = newRepo()
+  const cat = hookCatalog()
+  const r = run(repo, ['--from', cat, '--skill', 'hello-rules'])
+  assert.equal(r.status, 0, r.stderr)
+
+  assert.equal(read(repo, '.claude', 'hooks', 'check.mjs'), 'CHECK v1\n')
+  assert.deepEqual(settings(repo).hooks.Stop, [
+    { hooks: [{ type: 'command', command: 'node check.mjs' }] },
+  ])
+  assert.ok(lock(repo).hooks['check.mjs'].hash, 'hook hash recorded')
+  assert.equal(lock(repo).settingsHooks.length, 1, 'settings group recorded')
+  assert.match(r.stdout, /1 hook/)
+})
+
+test('a nested hook file is vendored too', () => {
+  const repo = newRepo()
+  const r = run(repo, ['--from', hookCatalog({ second: true }), '--skill', 'hello-rules'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.equal(read(repo, '.claude', 'hooks', 'nested', 'extra.sh'), 'EXTRA v1\n')
+  assert.equal(Object.keys(lock(repo).hooks).length, 2)
+})
+
+test("the repo's own settings.json keys and hooks survive the merge", () => {
+  const repo = newRepo()
+  mkdirSync(join(repo, '.claude'), { recursive: true })
+  writeFileSync(
+    join(repo, '.claude', 'settings.json'),
+    JSON.stringify({
+      model: 'opus',
+      hooks: { Stop: [{ hooks: [{ type: 'command', command: 'mine.sh' }] }] },
+    }),
+  )
+  const r = run(repo, ['--from', hookCatalog(), '--skill', 'hello-rules'])
+  assert.equal(r.status, 0, r.stderr)
+
+  const s = settings(repo)
+  assert.equal(s.model, 'opus', 'unrelated key kept')
+  assert.equal(s.hooks.Stop.length, 2, 'repo hook + catalog hook')
+  assert.equal(s.hooks.Stop[0].hooks[0].command, 'mine.sh', 'repo hook kept first')
+})
+
+test('--no-hooks skips the hooks and records the opt-out', () => {
+  const repo = newRepo()
+  const r = run(repo, ['--from', hookCatalog(), '--skill', 'hello-rules', '--no-hooks'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.ok(!has(repo, '.claude', 'hooks'), 'no hooks dir')
+  assert.ok(!has(repo, '.claude', 'settings.json'), 'no settings written')
+  assert.equal(config(repo).hooks, false, 'opt-out recorded')
+})
+
+test('--no-hooks takes back hooks a previous sync installed', () => {
+  const repo = newRepo()
+  const cat = hookCatalog()
+  run(repo, ['--from', cat, '--skill', 'hello-rules'])
+  assert.ok(has(repo, '.claude', 'hooks', 'check.mjs'))
+
+  const r = run(repo, ['--no-hooks'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.ok(!has(repo, '.claude', 'hooks', 'check.mjs'), 'hook file removed')
+  assert.ok(!has(repo, '.claude', 'settings.json'), 'empty settings file removed')
+  assert.equal(lock(repo).settingsHooks.length, 0)
+})
+
+test('--no-hooks leaves the repo its own settings hooks', () => {
+  const repo = newRepo()
+  const cat = hookCatalog()
+  run(repo, ['--from', cat, '--skill', 'hello-rules'])
+  const s = settings(repo)
+  s.hooks.Stop.push({ hooks: [{ type: 'command', command: 'mine.sh' }] })
+  writeFileSync(join(repo, '.claude', 'settings.json'), JSON.stringify(s))
+
+  run(repo, ['--no-hooks'])
+  assert.deepEqual(settings(repo).hooks.Stop, [
+    { hooks: [{ type: 'command', command: 'mine.sh' }] },
+  ])
+})
+
+test('a repo-authored hook file is never clobbered', () => {
+  const repo = newRepo()
+  mkdirSync(join(repo, '.claude', 'hooks'), { recursive: true })
+  writeFileSync(join(repo, '.claude', 'hooks', 'check.mjs'), 'MINE\n')
+
+  const r = run(repo, ['--from', hookCatalog(), '--skill', 'hello-rules'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.equal(read(repo, '.claude', 'hooks', 'check.mjs'), 'MINE\n')
+  assert.match(r.stderr, /repo-authored/)
+})
+
+test('a hook dropped from the catalog is dropped from the repo', () => {
+  const repo = newRepo()
+  run(repo, ['--from', hookCatalog({ second: true }), '--skill', 'hello-rules'])
+  assert.ok(has(repo, '.claude', 'hooks', 'nested', 'extra.sh'))
+
+  const r = run(repo, ['--from', hookCatalog(), '--skill', 'hello-rules'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.ok(!has(repo, '.claude', 'hooks', 'nested', 'extra.sh'), 'stale hook removed')
+  assert.ok(has(repo, '.claude', 'hooks', 'check.mjs'), 'current hook kept')
+})
+
+test('a changed hook is updated, and its old settings group replaced', () => {
+  const repo = newRepo()
+  run(repo, ['--from', hookCatalog(), '--skill', 'hello-rules'])
+  const next = hookCatalog({
+    hook: 'CHECK v2\n',
+    settings: { hooks: { Stop: [{ hooks: [{ type: 'command', command: 'node check.mjs --v2' }] }] } },
+  })
+  const r = run(repo, ['--from', next, '--skill', 'hello-rules'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.equal(read(repo, '.claude', 'hooks', 'check.mjs'), 'CHECK v2\n')
+  assert.deepEqual(settings(repo).hooks.Stop, [
+    { hooks: [{ type: 'command', command: 'node check.mjs --v2' }] },
+  ])
+})
+
+test('--dry-run writes no hook and no settings', () => {
+  const repo = newRepo()
+  const r = run(repo, ['--from', hookCatalog(), '--skill', 'hello-rules', '--dry-run'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.ok(!has(repo, '.claude', 'hooks'), 'no hooks dir')
+  assert.ok(!has(repo, '.claude', 'settings.json'), 'no settings')
+})
+
+test('a re-sync with no change rewrites nothing', () => {
+  const repo = newRepo()
+  const cat = hookCatalog()
+  run(repo, ['--from', cat, '--skill', 'hello-rules'])
+  const before = statSync(join(repo, '.claude', 'settings.json')).mtimeMs
+  const old = new Date(Date.now() - 60_000)
+  utimesSync(join(repo, '.claude', 'settings.json'), old, old)
+
+  run(repo, [])
+  assert.equal(
+    statSync(join(repo, '.claude', 'settings.json')).mtimeMs,
+    old.getTime(),
+    'settings left untouched on a no-op re-sync',
+  )
+  assert.ok(before)
+})
+
+test('--hooks and --no-hooks together fail', () => {
+  const repo = newRepo()
+  const r = run(repo, ['--from', hookCatalog(), '--skill', 'hello-rules', '--hooks', '--no-hooks'])
+  assert.equal(r.status, 1)
+  assert.match(r.stderr, /contradict/)
+})
+
+test('--hooks opts a repo back in', () => {
+  const repo = newRepo()
+  const cat = hookCatalog()
+  run(repo, ['--from', cat, '--skill', 'hello-rules', '--no-hooks'])
+  const r = run(repo, ['--hooks'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.ok(has(repo, '.claude', 'hooks', 'check.mjs'), 'hook back')
+  assert.equal(config(repo).hooks, undefined, 'opt-out cleared')
+})
+
+test('a catalog with no hooks touches no settings', () => {
+  const repo = newRepo()
+  const r = run(repo, ['--from', CATALOG, '--skill', 'hello-rules'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.ok(!has(repo, '.claude', 'settings.json'), 'no settings file invented')
+  assert.deepEqual(lock(repo).hooks, {})
+})
