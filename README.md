@@ -150,6 +150,50 @@ overwritten, or removed — and writes nothing. Re-run without it to apply.
 npx skills-syncer --from github:acme/our-skills --skill '*' --dry-run
 ```
 
+### 10. Take skills from more than one source
+
+Your catalog has its own skills. You also want a few skills from a public repo,
+without changes, and with every update it ships. Add a `sources` list to
+`skills-syncer.json`, then run a bare sync:
+
+```json
+{
+  "from": "github:acme/our-skills",
+  "skills": ["*"],
+  "sources": [
+    { "from": "github:someone/marketing-skills#v2.9.1", "skills": ["copywriting", "emails"] }
+  ]
+}
+```
+
+```bash
+npx skills-syncer
+```
+
+- **The top-level `from` is the main source.** Only the main source writes
+  `AGENTS.md`, `CLAUDE.md` and the hooks. A public repo often has its own
+  `AGENTS.md`, and it must not replace yours.
+- **An extra source gives skills and agents.** Its `skill-agents.json` works as
+  usual. Each entry takes `from`, `skills` and `agents`.
+- **One name may come from one source only.** A skill or an agent in two sources
+  stops the sync. The error names both sources. For an agent that a skill pulled
+  in, it also names that skill.
+- **One source may appear once.** The same repo twice, even with two `#ref`
+  values, stops the sync.
+- **The lock records the commit of each `github:` source.** The key is the source
+  without its `#ref`. The lock takes a new commit only when an item from that
+  source changed. A commit that touched other files leaves the lock as it is.
+  When the lock takes a new commit, the sync prints a line:
+
+  ```text
+  moved github:someone/marketing-skills: 30bc89d → 2c13acc
+  ```
+
+To update an extra source, change its `#ref` and sync again. Pin it to a tag:
+`#ref` takes a branch or a tag, not a commit hash. Remove an entry from `sources`,
+and the next sync removes its skills. `--from` on the command line changes the
+main source only, and it keeps the `sources` list as it is.
+
 ## Flags
 
 | Flag | Meaning |
@@ -267,7 +311,7 @@ bundled catalog again).
 | `AGENTS.md` | shared block merged in, repo notes kept below |
 | `CLAUDE.md` | symlink → `AGENTS.md`, or `@AGENTS.md` in a real file with `--claude-import`, or nothing with `--no-claude-link` (a repo-authored `CLAUDE.md` is never touched) |
 | `skills-syncer.json` | your choice: source + selection (hand-editable, committed) |
-| `skills-syncer-lock.json` | generated manifest: per-item content hash |
+| `skills-syncer-lock.json` | generated manifest: per-item content hash, the source of an item from an extra source, the commit of each `github:` source |
 
 A re-sync replaces only what the lock installed and removes what you dropped from
 the selection — it never touches a repo-authored skill or agent.
@@ -293,7 +337,8 @@ fields and run a bare `npx skills-syncer` instead of retyping flags:
 
 `claudeLink` is optional. It appears only when the repo picked something other
 than the default symlink: `"import"` for the `@AGENTS.md` file, or `false` for no
-`CLAUDE.md` at all.
+`CLAUDE.md` at all. `sources` is optional too, see
+[Take skills from more than one source](#10-take-skills-from-more-than-one-source).
 
 ## Hooks
 
