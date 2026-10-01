@@ -65,6 +65,8 @@ re-sync stays a clean no-op even if an external formatter reflowed them.
 - The two state files are distinct: `skills-syncer.json` is hand-editable intent
   (source + selection); `skills-syncer-lock.json` is generated (per-item hash).
   Never write hashes into the intent file.
+- Only the main source (the top-level `from`) writes `AGENTS.md`, `CLAUDE.md`
+  and the hooks. An entry in `sources` gives skills and agents, nothing else.
 
 ## Verifying a change
 
@@ -80,8 +82,11 @@ throwaway catalog fixture. They cover: selection installed, manifest-required
 agents pulled, cleanup on a narrowed selection, repo-authored files never
 clobbered, locally-edited copies overwritten with a warning, `AGENTS.md` merged
 with a single shared block, an unchanged item skipped on re-sync (no churn),
-`--all` fleet mode (incl. carrying on past a failed repo), and strict flag
-validation (unknown flag / missing value / stray positional all fail). Add a
+`--all` fleet mode (incl. carrying on past a failed repo), strict flag
+validation (unknown flag / missing value / stray positional all fail), and extra
+sources: their skills installed, the shared files left to the main source, a
+name clash stopped, and the commit of a `github:` source recorded. That last
+case clones offline: git's `insteadOf` maps `https://github.com/` to a folder. Add a
 case here when you change behaviour.
 
 For a quick manual smoke test against a real catalog:

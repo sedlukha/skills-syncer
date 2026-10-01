@@ -17,6 +17,14 @@
 //   ./AGENTS.md                <- the catalog's shared block, merged in (if present)
 //   ./skills-syncer.json           <- your choice: source + selection (hand-editable)
 //   ./skills-syncer-lock.json      <- generated manifest: per-item content hash
+//
+// A repo can take skills from more than one source. The top-level `from` is the
+// MAIN source: it alone writes AGENTS.md, CLAUDE.md and the hooks. Each entry in
+// the optional `sources` list of skills-syncer.json adds skills and agents only:
+//   { "from": "github:acme/our-skills", "skills": ["*"],
+//     "sources": [{ "from": "github:someone/skills#v2.0.0", "skills": ["emails"] }] }
+// One name in two sources stops the sync. The lock records the commit of each
+// github: source, so a re-sync can say when an upstream moved.
 // The one exception is a same-repo symlink CLAUDE.md -> AGENTS.md, so Claude Code
 // reads the shared instructions too. Its target sits in the same repo, so it
 // still rides with git into worktrees and the sandbox (a cross-repo link would not).
@@ -68,23 +76,30 @@ import { fileURLToPath } from 'node:url'
  * @typedef {boolean | 'symlink' | 'import'} ClaudeLink
  *   How CLAUDE.md points at AGENTS.md: a symlink (default), an `@AGENTS.md`
  *   import inside a real file, or nothing at all (`false`).
+ * @typedef {{ from: string, skills?: string[], agents?: string[] }} ExtraSource
+ *   One more source: skills and agents only, never the shared files.
  * @typedef {{ from?: string, skills?: string[], agents?: string[], claudeLink?: ClaudeLink,
- *             hooks?: boolean }} Config
+ *             hooks?: boolean, sources?: ExtraSource[] }} Config
  *   Hand-editable intent file (skills-syncer.json): source + literal selection.
  *   `claudeLink` records a non-default CLAUDE.md choice (`false` or `"import"`).
  *   `hooks: false` opts the repo out of the catalog's hooks.
+ *   `sources` lists extra sources beside the main one.
  * @typedef {Record<string, string[]>} Manifest  skill -> agents it requires
- * @typedef {{ hash: string }} SkillEntry
- * @typedef {{ hash: string, explicit: boolean, requiredBy: string[] }} AgentEntry
+ * @typedef {{ hash: string, from?: string }} SkillEntry
+ *   `from` is set only for an item from an extra source.
+ * @typedef {{ hash: string, explicit: boolean, requiredBy: string[], from?: string }} AgentEntry
  * @typedef {{ hash: string }} HookEntry
  * @typedef {{ version: number, source: string, skills: Record<string, SkillEntry>,
  *             agents: Record<string, AgentEntry>, hooks: Record<string, HookEntry>,
- *             settingsHooks: string[] }} Lock
+ *             settingsHooks: string[], commits?: Record<string, string> }} Lock
  *   Generated manifest (skills-syncer-lock.json): per-item content hash.
+ *   `commits` maps each github: source (without its #ref) to the commit it gave.
  *   `settingsHooks` lists the settings.json hook groups this tool installed, so a
  *   later sync can take them back out without touching the repo's own hooks.
- * @typedef {{ root: string, cleanup: () => void, sourceId: string, bundled: boolean }} Catalog
- *   A resolved source: where it lives, how to clean it up, its lock label.
+ * @typedef {{ root: string, cleanup: () => void, sourceId: string, bundled: boolean,
+ *             commit?: string }} Catalog
+ *   A resolved source: where it lives, how to clean it up, its lock label, and
+ *   for a github: source the commit it was cloned at.
  */
 
 // Markers that fence the shared block inside a repo's AGENTS.md.
@@ -113,6 +128,7 @@ const SYM = { ok: COLOR ? '✓' : 'OK', fail: COLOR ? '✗' : 'XX', skip: COLOR 
  *            claudeMode?: 'symlink' | 'import' | 'off',
  *            removed: { skills: string[], agents: string[], hooks?: string[] } }} r @returns {string} */
 function describe(r) {
+  /** @param {number} n @param {string} w */
   const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`
   const parts = [plural(r.nSkills, 'skill')]
   if (r.nAgents) parts.push(plural(r.nAgents, 'agent'))
@@ -151,7 +167,7 @@ function parseListArg(argv, flag) {
 // --- source resolution ------------------------------------------------------
 // A `github:owner/repo[#ref]` source is shallow-cloned to a temp dir; a local
 // path is used in place.
-/** @param {string} from @returns {{ root: string, cleanup: () => void }} */
+/** @param {string} from @returns {{ root: string, cleanup: () => void, commit?: string }} */
 function resolveSource(from) {
   if (from.startsWith('github:')) {
     const spec = from.slice('github:'.length)
@@ -168,7 +184,13 @@ function resolveSource(from) {
       const e = /** @type {{ stderr?: Buffer, message?: string }} */ (err)
       fail(`could not clone ${url}${ref ? ` (ref ${ref})` : ''}\n  ${String(e.stderr || e.message).trim()}`)
     }
-    return { root: dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
+    let commit
+    try {
+      commit = execFileSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+    } catch {
+      /* no commit to record — the sync itself still works */
+    }
+    return { root: dir, cleanup: () => rmSync(dir, { recursive: true, force: true }), commit }
   }
   const root = resolve(from)
   if (!existsSync(root)) fail(`source path does not exist: ${root}`)
@@ -181,7 +203,7 @@ function resolveSource(from) {
 function resolveCatalog(from) {
   if (from) {
     const s = resolveSource(from)
-    return { root: s.root, cleanup: s.cleanup, sourceId: from, bundled: false }
+    return { root: s.root, cleanup: s.cleanup, sourceId: from, bundled: false, commit: s.commit }
   }
   const cat = bundledCatalogRoot()
   if (!cat) fail('no source. pass --from <github:owner/repo | ./path>, or add it to skills-syncer.json.')
@@ -350,84 +372,182 @@ function bundledName(pkgRoot) {
   return (pkg && pkg.name) || null
 }
 
+// --- per-source plan ----------------------------------------------------------
+// What one source gives: its selection expanded and checked against what it
+// holds, plus the agents its skills require. The main source and every extra
+// source go through the same plan, so they behave the same way.
+/**
+ * @typedef {{ cat: Catalog, main: boolean, srcSkillsDir: string, srcAgentsDir: string,
+ *             skills: string[], explicitAgents: Set<string>,
+ *             requiredBy: Map<string, string[]>, agents: string[], changed: boolean }} Plan
+ *   `changed` turns true when the sync installs a new or different item from
+ *   this source. Only then does the lock take the source's new commit.
+ * @param {Catalog} cat @param {string[]} skills @param {string[]} agents
+ * @param {boolean} main true for the main source, false for an extra one
+ * @returns {Plan}
+ */
+function planSource(cat, skills, agents, main) {
+  const root = cat.root
+  const srcSkillsDir = pick(root, ['skills'], ['.claude', 'skills'])
+  const srcAgentsDir = pick(root, ['agents'], ['.claude', 'agents'])
+  // An extra source names itself in every message; the main one never did.
+  const of = main ? '' : ` ${cat.sourceId}`
+
+  const availableSkills = listDirs(srcSkillsDir)
+  const availableAgents = listAgents(srcAgentsDir)
+  if (!availableSkills.length && !availableAgents.length) {
+    fail(`no skills or agents found in source${of} (looked in ${srcSkillsDir} and ${srcAgentsDir})`)
+  }
+
+  const rawManifest = readJson(join(root, 'skill-agents.json')) || {}
+  /** @type {Manifest} */
+  const manifest = {}
+  for (const [skill, ags] of Object.entries(rawManifest)) {
+    if (!skill.startsWith('$')) manifest[skill] = ags // skip $comment et al.
+  }
+
+  // Expand '*' against the catalog; keep the literal selection for the intent file.
+  const skillSel = skills.includes('*') ? availableSkills.slice() : skills.slice()
+  const agentSel = agents.includes('*') ? availableAgents.slice() : agents.slice()
+  if (!skillSel.length && !agentSel.length) {
+    fail(
+      main
+        ? 'nothing to sync: no --skill/--agent given and skills-syncer.json has no selection.'
+        : `nothing to sync from ${cat.sourceId}: its entry in "sources" selects no skill or agent.`,
+    )
+  }
+
+  // Drop names missing from the source; warn so a typo or deletion is visible.
+  /** @param {string[]} names @param {string[]} available @param {string} kind @returns {string[]} */
+  const keepKnown = (names, available, kind) => {
+    for (const n of names.filter((n) => !available.includes(n)))
+      console.warn(`[skills-syncer] skip ${kind} "${n}": not in source${of} (deleted or misspelled)`)
+    return names.filter((n) => available.includes(n))
+  }
+  const known = keepKnown(skillSel, availableSkills, 'skill')
+  const explicitAgents = new Set(keepKnown(agentSel, availableAgents, 'agent'))
+
+  // Agents required by selected skills, via the manifest.
+  /** @type {Map<string, string[]>} */
+  const requiredBy = new Map()
+  for (const skill of known) {
+    for (const role of manifest[skill] || []) {
+      if (!availableAgents.includes(role)) {
+        console.warn(`[skills-syncer] ${skill} requires agent "${role}" but it is not in source${of} — skip`)
+        continue
+      }
+      if (!requiredBy.has(role)) requiredBy.set(role, [])
+      requiredBy.get(role)?.push(skill)
+    }
+  }
+  const toInstall = [...new Set([...explicitAgents, ...requiredBy.keys()])]
+  return {
+    cat, main, srcSkillsDir, srcAgentsDir, skills: known, explicitAgents, requiredBy, agents: toInstall,
+    changed: false,
+  }
+}
+
+// One name may come from one source only. Two sources that both ship a skill
+// called "emails" would overwrite each other on every sync, so stop instead.
+// An agent may arrive because a skill needs it, so the message says why it came.
+/** @param {Plan[]} plans @returns {void} */
+function checkClashes(plans) {
+  for (const kind of /** @type {const} */ (['skills', 'agents'])) {
+    /** @type {Map<string, Plan>} */
+    const owner = new Map()
+    for (const p of plans) {
+      for (const name of p[kind]) {
+        const other = owner.get(name)
+        if (other === undefined) {
+          owner.set(name, p)
+          continue
+        }
+        if (kind === 'skills') {
+          fail(`skill "${name}" comes from two sources: ${other.cat.sourceId} and ${p.cat.sourceId}. Select it in one of them only.`)
+        }
+        /** @param {Plan} q @returns {string} */
+        const why = (q) =>
+          q.explicitAgents.has(name)
+            ? `${q.cat.sourceId} (selected)`
+            : `${q.cat.sourceId} (required by ${(q.requiredBy.get(name) || []).map((n) => `"${n}"`).join(', ')})`
+        fail(`agent "${name}" comes from two sources: ${why(other)} and ${why(p)}. Drop one of those skills, or select the agent in one source only.`)
+      }
+    }
+  }
+}
+
+// The lock keys a commit by the source WITHOUT its #ref. So a move from
+// `#v1.0.0` to `#v1.1.0` still reads as one source whose commit changed.
+/** @param {string} sourceId @returns {string} */
+const commitKey = (sourceId) => sourceId.split('#')[0]
+
 // --- the sync itself --------------------------------------------------------
 // Sync one repo (`cwd`) from a catalog. Prints its own warnings + a report line.
 // `catalog` may be pre-resolved (the caller then owns its cleanup) — `--all`
-// uses this to fetch a shared source once and reuse it across repos.
+// uses this to fetch a shared source once and reuse it across repos. `resolve`
+// does the same for the extra sources.
 /**
  * @typedef {{ repoName: string, nSkills: number, nAgents: number, nHooks: number,
  *             wroteAgentsMd: boolean,
  *             claudeLink: 'created' | 'fixed' | 'ok' | 'skipped' | 'removed' | 'off' | null,
  *             claudeMode: 'symlink' | 'import' | 'off',
- *             sourceId: string,
+ *             sourceId: string, moved: string[],
  *             removed: { skills: string[], agents: string[], hooks: string[] } }} SyncResult
+ *   `moved` holds one line per source whose commit changed since the last sync.
  * @param {{ cwd: string, from?: string, skills: string[], agents: string[],
- *           claudeLink?: ClaudeLink, hooks?: boolean, dryRun: boolean,
- *           catalog?: Catalog, quiet?: boolean }} o
+ *           sources?: ExtraSource[], claudeLink?: ClaudeLink, hooks?: boolean, dryRun: boolean,
+ *           catalog?: Catalog, resolve?: (from: string) => Catalog, quiet?: boolean }} o
  * @returns {SyncResult}
  */
 function sync(o) {
   const { cwd, skills, agents, dryRun, quiet } = o
   const claudeMode = claudeModeOf(o.claudeLink)
   const cat = o.catalog || resolveCatalog(o.from)
+  /** @type {Catalog[]} extra catalogs this call resolved, so it must clean them up */
+  const own = []
   try {
     const root = cat.root
     if (resolve(root) === resolve(cwd)) fail('refusing to sync the source into itself')
+    // skills-syncer.json is edited by hand, so check its shape before use.
+    if (o.sources !== undefined && !Array.isArray(o.sources)) fail('"sources" in skills-syncer.json must be a list.')
+    const sources = o.sources || []
 
-    const srcSkillsDir = pick(root, ['skills'], ['.claude', 'skills'])
-    const srcAgentsDir = pick(root, ['agents'], ['.claude', 'agents'])
     const srcHooksDir = pick(root, ['hooks'], ['.claude', 'hooks'])
     const srcSettings = pick(root, ['settings.json'], ['.claude', 'settings.json'])
     const srcAgentsMd = join(root, 'AGENTS.md')
-    const manifestPath = join(root, 'skill-agents.json')
     // Hooks ride with the catalog, not with a per-skill selection: a hook is
     // repo-wide wiring, not a document an agent loads. A repo opts out instead.
     const hooksOn = o.hooks !== false
 
-    const availableSkills = listDirs(srcSkillsDir)
-    const availableAgents = listAgents(srcAgentsDir)
-    if (!availableSkills.length && !availableAgents.length) {
-      fail(`no skills or agents found in source (looked in ${srcSkillsDir} and ${srcAgentsDir})`)
-    }
-
-    const rawManifest = readJson(manifestPath) || {}
-    /** @type {Manifest} */
-    const manifest = {}
-    for (const [skill, ags] of Object.entries(rawManifest)) {
-      if (!skill.startsWith('$')) manifest[skill] = ags // skip $comment et al.
-    }
-
-    // Expand '*' against the catalog; keep the literal selection for the intent file.
-    let skillSel = skills.includes('*') ? availableSkills.slice() : skills.slice()
-    let agentSel = agents.includes('*') ? availableAgents.slice() : agents.slice()
-    if (!skillSel.length && !agentSel.length) {
-      fail('nothing to sync: no --skill/--agent given and skills-syncer.json has no selection.')
-    }
-
-    // Drop names missing from the source; warn so a typo or deletion is visible.
-    /** @param {string[]} names @param {string[]} available @param {string} kind @returns {string[]} */
-    const keepKnown = (names, available, kind) => {
-      for (const n of names.filter((n) => !available.includes(n)))
-        console.warn(`[skills-syncer] skip ${kind} "${n}": not in source (deleted or misspelled)`)
-      return names.filter((n) => available.includes(n))
-    }
-    skillSel = keepKnown(skillSel, availableSkills, 'skill')
-    const explicitAgents = new Set(keepKnown(agentSel, availableAgents, 'agent'))
-
-    // Agents required by selected skills, via the manifest.
-    /** @type {Map<string, string[]>} */
-    const requiredBy = new Map()
-    for (const skill of skillSel) {
-      for (const role of manifest[skill] || []) {
-        if (!availableAgents.includes(role)) {
-          console.warn(`[skills-syncer] ${skill} requires agent "${role}" but it is not in source — skip`)
-          continue
-        }
-        if (!requiredBy.has(role)) requiredBy.set(role, [])
-        requiredBy.get(role)?.push(skill)
+    /** @type {Plan[]} */
+    const plans = [planSource(cat, skills, agents, true)]
+    // One source twice would give two commits under one lock key, and every
+    // name it ships would clash with itself. Ask for one entry instead.
+    /** @type {Map<string, string>} */
+    const seen = new Map([[commitKey(cat.sourceId), cat.sourceId]])
+    sources.forEach((src, i) => {
+      if (!src || typeof src.from !== 'string' || !src.from) {
+        fail(`"sources" entry ${i + 1} in skills-syncer.json needs a "from".`)
       }
-    }
-    const agentsToInstall = new Set([...explicitAgents, ...requiredBy.keys()])
+      for (const key of /** @type {const} */ (['skills', 'agents'])) {
+        if (src[key] !== undefined && !Array.isArray(src[key])) {
+          fail(`"sources" entry ${i + 1} in skills-syncer.json: "${key}" must be a list.`)
+        }
+      }
+      const twin = seen.get(commitKey(src.from))
+      if (twin !== undefined) fail(`source ${commitKey(src.from)} is listed twice: as ${twin} and ${src.from}. Keep one entry.`)
+      seen.set(commitKey(src.from), src.from)
+      /** @type {Catalog} */
+      let extra
+      if (o.resolve) extra = o.resolve(src.from)
+      else {
+        extra = resolveCatalog(src.from)
+        own.push(extra)
+      }
+      if (resolve(extra.root) === resolve(cwd)) fail('refusing to sync the source into itself')
+      plans.push(planSource(extra, src.skills || [], src.agents || [], false))
+    })
+    checkClashes(plans)
 
     const skillsDest = join(cwd, '.claude', 'skills')
     const agentsDest = join(cwd, '.claude', 'agents')
@@ -437,46 +557,56 @@ function sync(o) {
     const lock = { version: 1, source: cat.sourceId, skills: {}, agents: {}, hooks: {}, settingsHooks: [] }
 
     // --- install skills (incremental + atomic) --------------------------------
-    for (const name of [...skillSel].sort()) {
-      const srcDir = join(srcSkillsDir, name)
-      const dest = join(skillsDest, name)
-      const prev = prevLock?.skills?.[name]
-      const exists = existsSync(dest)
-      // Never clobber a repo-authored skill: on disk but not in our lock.
-      if (exists && !prev) {
-        console.warn(`[skills-syncer] skip skill "${name}": .claude/skills/${name}/ exists but is not managed by skills-syncer (repo-authored). Remove it to vendor this skill.`)
-        continue
+    for (const p of plans) {
+      // An item from an extra source records where it came from.
+      const from = p.main ? {} : { from: p.cat.sourceId }
+      for (const name of [...p.skills].sort()) {
+        const srcDir = join(p.srcSkillsDir, name)
+        const dest = join(skillsDest, name)
+        const prev = prevLock?.skills?.[name]
+        const exists = existsSync(dest)
+        // Never clobber a repo-authored skill: on disk but not in our lock.
+        if (exists && !prev) {
+          console.warn(`[skills-syncer] skip skill "${name}": .claude/skills/${name}/ exists but is not managed by skills-syncer (repo-authored). Remove it to vendor this skill.`)
+          continue
+        }
+        const srcHash = dirHash(srcDir)
+        const destHash = exists ? dirHash(dest) : null
+        if (prev && destHash !== null && destHash !== prev.hash) {
+          console.warn(`[skills-syncer] skill "${name}" was edited locally since last sync — ${dryRun ? 'would overwrite' : 'overwriting'}. Make the change in the source catalog instead.`)
+        }
+        // Already in sync? leave it alone. Otherwise install it atomically.
+        if (destHash !== srcHash && !dryRun) installDir(srcDir, dest)
+        if (prev?.hash !== srcHash || prev?.from !== from.from) p.changed = true
+        lock.skills[name] = { hash: srcHash, ...from }
       }
-      const srcHash = dirHash(srcDir)
-      const destHash = exists ? dirHash(dest) : null
-      if (prev && destHash !== null && destHash !== prev.hash) {
-        console.warn(`[skills-syncer] skill "${name}" was edited locally since last sync — ${dryRun ? 'would overwrite' : 'overwriting'}. Make the change in the source catalog instead.`)
-      }
-      // Already in sync? leave it alone. Otherwise install it atomically.
-      if (destHash !== srcHash && !dryRun) installDir(srcDir, dest)
-      lock.skills[name] = { hash: srcHash }
     }
 
     // --- install agents -------------------------------------------------------
-    for (const role of [...agentsToInstall].sort()) {
-      const srcFile = join(srcAgentsDir, `${role}.md`)
-      const dest = join(agentsDest, `${role}.md`)
-      const prev = prevLock?.agents?.[role]
-      const exists = existsSync(dest)
-      if (exists && !prev) {
-        console.warn(`[skills-syncer] skip agent "${role}": .claude/agents/${role}.md exists but is not managed by skills-syncer (repo-authored). Remove it to vendor this agent.`)
-        continue
-      }
-      const srcHash = fileHash(srcFile)
-      const destHash = exists ? fileHash(dest) : null
-      if (prev && destHash !== null && destHash !== prev.hash) {
-        console.warn(`[skills-syncer] agent "${role}" was edited locally since last sync — ${dryRun ? 'would overwrite' : 'overwriting'}. Make the change in the source catalog instead.`)
-      }
-      if (destHash !== srcHash && !dryRun) installFile(srcFile, dest)
-      lock.agents[role] = {
-        hash: srcHash,
-        explicit: explicitAgents.has(role),
-        requiredBy: (requiredBy.get(role) || []).sort(),
+    for (const p of plans) {
+      const from = p.main ? {} : { from: p.cat.sourceId }
+      for (const role of [...p.agents].sort()) {
+        const srcFile = join(p.srcAgentsDir, `${role}.md`)
+        const dest = join(agentsDest, `${role}.md`)
+        const prev = prevLock?.agents?.[role]
+        const exists = existsSync(dest)
+        if (exists && !prev) {
+          console.warn(`[skills-syncer] skip agent "${role}": .claude/agents/${role}.md exists but is not managed by skills-syncer (repo-authored). Remove it to vendor this agent.`)
+          continue
+        }
+        const srcHash = fileHash(srcFile)
+        const destHash = exists ? fileHash(dest) : null
+        if (prev && destHash !== null && destHash !== prev.hash) {
+          console.warn(`[skills-syncer] agent "${role}" was edited locally since last sync — ${dryRun ? 'would overwrite' : 'overwriting'}. Make the change in the source catalog instead.`)
+        }
+        if (destHash !== srcHash && !dryRun) installFile(srcFile, dest)
+        if (prev?.hash !== srcHash || prev?.from !== from.from) p.changed = true
+        lock.agents[role] = {
+          hash: srcHash,
+          explicit: p.explicitAgents.has(role),
+          requiredBy: (p.requiredBy.get(role) || []).sort(),
+          ...from,
+        }
       }
     }
 
@@ -537,7 +667,31 @@ function sync(o) {
       dryRun,
     )
 
+    // --- the commit each github: source gave --------------------------------
+    // A source keeps its old commit while nothing it gives has changed. A new
+    // commit that only touched other files would rewrite the lock on every
+    // sync, so the lock names the commit the current content came from.
+    /** @type {Record<string, string>} */
+    const commits = {}
+    /** @type {string[]} */
+    const moved = []
+    for (const p of plans) {
+      if (!p.cat.commit) continue
+      const key = commitKey(p.cat.sourceId)
+      const was = prevLock?.commits?.[key]
+      if (was && !p.changed) {
+        commits[key] = was
+        continue
+      }
+      commits[key] = p.cat.commit
+      if (was && was !== p.cat.commit) moved.push(`${key}: ${was.slice(0, 7)} → ${p.cat.commit.slice(0, 7)}`)
+    }
+    // Left out when empty, so a repo on local sources keeps its old lock shape.
+    if (Object.keys(commits).length) lock.commits = commits
+
     // --- shared AGENTS.md block + persisted state -----------------------------
+    // Only the main source writes the shared files. An extra source gives
+    // skills and agents, never AGENTS.md, CLAUDE.md or hooks.
     const wroteAgentsMd = syncAgentsMd(cwd, srcAgentsMd, dryRun)
     // Mirror AGENTS.md as CLAUDE.md so Claude Code picks it up too — as a symlink
     // or as an `@AGENTS.md` import. When off, a link we made is taken back out.
@@ -558,6 +712,8 @@ function sync(o) {
         ...(claudeMode === 'import' ? { claudeLink: 'import' } : {}),
         // Hooks are on by default, so only the opt-out is recorded.
         ...(hooksOn ? {} : { hooks: false }),
+        // Extra sources are kept exactly as written, with their literal selection.
+        ...(sources.length ? { sources } : {}),
       }
       writeJsonStable(join(cwd, 'skills-syncer.json'), intent)
       writeJsonStable(join(cwd, 'skills-syncer-lock.json'), lock)
@@ -574,6 +730,7 @@ function sync(o) {
       claudeLink,
       claudeMode,
       sourceId: cat.sourceId,
+      moved,
       removed,
     }
     // In --all (quiet) the caller prints an aligned line per repo; standalone we
@@ -582,8 +739,9 @@ function sync(o) {
       const verb = dryRun ? `${c.dim('(dry-run)')} would sync` : c.green('synced')
       console.log(
         `${dryRun ? c.dim(SYM.skip) : c.green(SYM.ok)} ${verb} ${describe(result)} ` +
-          `${c.dim('→')} ${c.bold(result.repoName)}  ${c.dim(`(${cat.sourceId})`)}`,
+          `${c.dim('→')} ${c.bold(result.repoName)}  ${c.dim(`(${sourceLabel(cat.sourceId, sources)})`)}`,
       )
+      for (const line of moved) console.log(`  ${c.cyan('moved')} ${line}`)
       const rverb = dryRun ? 'would remove' : 'removed'
       if (removed.skills.length) console.log(`  ${c.yellow(`${rverb} skills:`)} ${removed.skills.join(', ')}`)
       if (removed.agents.length) console.log(`  ${c.yellow(`${rverb} agents:`)} ${removed.agents.join(', ')}`)
@@ -593,7 +751,14 @@ function sync(o) {
     return result
   } finally {
     if (!o.catalog) cat.cleanup()
+    for (const x of own) x.cleanup()
   }
+}
+
+// "github:acme/skills" alone, or "github:acme/skills + 2 more" with extra sources.
+/** @param {string} sourceId @param {ExtraSource[]} sources @returns {string} */
+function sourceLabel(sourceId, sources) {
+  return sources.length ? `${sourceId} + ${sources.length} more` : sourceId
 }
 
 // --- fleet mode -------------------------------------------------------------
@@ -631,40 +796,64 @@ function runAll(o) {
 
   /** @type {string[]} */ const ok = []
   /** @type {string[]} */ const failed = []
-  for (const grp of groups.values()) {
-    // Source line once per group, not once per repo (the old noise).
-    console.log(`${c.dim('  from')} ${c.cyan(grp.from || '<bundled>')}`)
-    const catalog = tryResolve(grp.from)
-    if (!catalog) {
-      for (const name of grp.repos) {
-        console.log(`    ${c.red(SYM.fail)} ${name.padEnd(pad)}  ${c.red('source could not be resolved')}`)
-        failed.push(name)
+  // Extra sources are resolved on first use and kept for the whole run, so two
+  // repos that take the same upstream clone it once. A source that failed to
+  // resolve keeps its error, and every repo that needs it fails the same way.
+  /** @type {Map<string, Catalog | SyncError>} */
+  const extras = new Map()
+  /** @param {string} from @returns {Catalog} */
+  const resolveExtra = (from) => {
+    if (!extras.has(from)) {
+      try {
+        extras.set(from, resolveCatalog(from))
+      } catch (err) {
+        if (!(err instanceof SyncError)) throw err
+        extras.set(from, err)
       }
-      continue
     }
-    try {
-      for (const name of grp.repos) {
-        /** @type {Config} */
-        const cfg = readJson(join(root, name, 'skills-syncer.json')) || {}
-        try {
-          const r = sync({
-            cwd: join(root, name), from: grp.from,
-            skills: cfg.skills || [], agents: cfg.agents || [],
-            claudeLink: o.claudeLink ?? cfg.claudeLink,
-            hooks: o.hooks ?? cfg.hooks,
-            dryRun, catalog, quiet: true,
-          })
-          console.log(`    ${c.green(SYM.ok)} ${c.bold(name.padEnd(pad))}  ${describe(r)}`)
-          ok.push(name)
-        } catch (err) {
-          if (!(err instanceof SyncError)) throw err
-          console.log(`    ${c.red(SYM.fail)} ${c.bold(name.padEnd(pad))}  ${c.red(err.message)}`)
+    const got = extras.get(from)
+    if (got instanceof SyncError) throw got
+    return /** @type {Catalog} */ (got)
+  }
+  try {
+    for (const grp of groups.values()) {
+      // Source line once per group, not once per repo (the old noise).
+      console.log(`${c.dim('  from')} ${c.cyan(grp.from || '<bundled>')}`)
+      const catalog = tryResolve(grp.from)
+      if (!catalog) {
+        for (const name of grp.repos) {
+          console.log(`    ${c.red(SYM.fail)} ${name.padEnd(pad)}  ${c.red('source could not be resolved')}`)
           failed.push(name)
         }
+        continue
       }
-    } finally {
-      catalog.cleanup()
+      try {
+        for (const name of grp.repos) {
+          /** @type {Config} */
+          const cfg = readJson(join(root, name, 'skills-syncer.json')) || {}
+          try {
+            const r = sync({
+              cwd: join(root, name), from: grp.from,
+              skills: cfg.skills || [], agents: cfg.agents || [], sources: cfg.sources,
+              claudeLink: o.claudeLink ?? cfg.claudeLink,
+              hooks: o.hooks ?? cfg.hooks,
+              dryRun, catalog, resolve: resolveExtra, quiet: true,
+            })
+            console.log(`    ${c.green(SYM.ok)} ${c.bold(name.padEnd(pad))}  ${describe(r)}`)
+            for (const line of r.moved) console.log(`      ${c.cyan('moved')} ${line}`)
+            ok.push(name)
+          } catch (err) {
+            if (!(err instanceof SyncError)) throw err
+            console.log(`    ${c.red(SYM.fail)} ${c.bold(name.padEnd(pad))}  ${c.red(err.message)}`)
+            failed.push(name)
+          }
+        }
+      } finally {
+        catalog.cleanup()
+      }
     }
+  } finally {
+    for (const x of extras.values()) if (!(x instanceof SyncError)) x.cleanup()
   }
 
   // Summary: keep the machine-greppable "synced N repo(s), skipped M" wording.
@@ -893,7 +1082,12 @@ Writes .claude/skills/, .claude/agents/, .claude/hooks/, the hooks block of
 into the current repo. Commit the result.
 
 Hooks follow the catalog, not the skill selection: a hook is repo-wide wiring,
-so every repo gets all of them, or none via --no-hooks.`
+so every repo gets all of them, or none via --no-hooks.
+
+More than one source: add a "sources" list to skills-syncer.json, then re-sync.
+  "sources": [{ "from": "github:owner/repo#tag", "skills": ["name"] }]
+An extra source gives skills and agents only. The main source alone writes
+AGENTS.md, CLAUDE.md and the hooks. One name in two sources stops the sync.`
 
 const VALUE_FLAGS = new Set(['--from', '--root']) // take exactly one value
 const LIST_FLAGS = new Set(['--skill', '--agent']) // take a list until the next flag
@@ -980,7 +1174,7 @@ function main() {
     const agents = argAgents?.length ? argAgents : config.agents || []
     const claudeLink = claudeLinkArg ?? config.claudeLink
     const hooks = hooksArg ?? config.hooks
-    sync({ cwd, from: from || undefined, skills, agents, claudeLink, hooks, dryRun })
+    sync({ cwd, from: from || undefined, skills, agents, sources: config.sources, claudeLink, hooks, dryRun })
   } catch (err) {
     if (err instanceof SyncError) {
       console.error(`[skills-syncer] ${err.message}`)

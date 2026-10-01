@@ -16,6 +16,7 @@ import {
   readFileSync,
   copyFileSync,
   existsSync,
+  readdirSync,
   utimesSync,
   statSync,
   lstatSync,
@@ -799,4 +800,284 @@ test('a catalog with no hooks touches no settings', () => {
   assert.equal(r.status, 0, r.stderr)
   assert.ok(!has(repo, '.claude', 'settings.json'), 'no settings file invented')
   assert.deepEqual(lock(repo).hooks, {})
+})
+
+// --- more than one source --------------------------------------------------
+// The main source owns the shared files. An extra source, listed under
+// "sources" in skills-syncer.json, gives skills and agents only.
+
+/** @returns {string} an upstream catalog with its own AGENTS.md and hooks */
+function extraCatalog() {
+  const root = mkdtempSync(join(tmpdir(), 'sst-extra-'))
+  /** @param {string} rel @param {string} body */
+  const w = (rel, body) => {
+    const p = join(root, rel)
+    mkdirSync(dirname(p), { recursive: true })
+    writeFileSync(p, body)
+  }
+  w('skills/emails/SKILL.md', 'EMAILS v1\n')
+  w('skills/hello-rules/SKILL.md', 'UPSTREAM HELLO\n')
+  w('agents/writer.md', 'WRITER v1\n')
+  w('skill-agents.json', JSON.stringify({ emails: ['writer'] }))
+  w('AGENTS.md', '# Upstream\n\nDo it our way.\n')
+  w('hooks/upstream.mjs', 'UPSTREAM HOOK\n')
+  w('settings.json', JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'up' }] }] } }))
+  return root
+}
+/** @param {string} repo @param {any} intent */
+const writeIntent = (repo, intent) => writeFileSync(join(repo, 'skills-syncer.json'), JSON.stringify(intent))
+
+test('an extra source adds its skills and the agents they need', () => {
+  const repo = newRepo()
+  const extra = extraCatalog()
+  const sources = [{ from: extra, skills: ['emails'] }]
+  writeIntent(repo, { from: CATALOG, skills: ['hello-rules'], agents: [], sources })
+  const r = run(repo, [])
+  assert.equal(r.status, 0, r.stderr)
+
+  assert.equal(read(repo, '.claude', 'skills', 'hello-rules', 'SKILL.md'), 'HELLO v1\n')
+  assert.equal(read(repo, '.claude', 'skills', 'emails', 'SKILL.md'), 'EMAILS v1\n')
+  assert.ok(has(repo, '.claude', 'agents', 'writer.md'), 'the extra manifest pulls its agent')
+
+  const l = lock(repo)
+  assert.equal(l.source, CATALOG, 'the lock still names the main source')
+  assert.equal(l.skills['hello-rules'].from, undefined, 'a main item records no source')
+  assert.equal(l.skills.emails.from, extra)
+  assert.equal(l.agents.writer.from, extra)
+  assert.deepEqual(config(repo).sources, sources, 'the sources list is kept as written')
+  assert.match(r.stdout, /\+ 1 more/)
+})
+
+test('an extra source never writes AGENTS.md or hooks', () => {
+  const repo = newRepo()
+  const extra = extraCatalog()
+  writeIntent(repo, { from: CATALOG, skills: ['hello-rules'], agents: [], sources: [{ from: extra, skills: ['emails'] }] })
+  const r = run(repo, [])
+  assert.equal(r.status, 0, r.stderr)
+
+  const agentsMd = read(repo, 'AGENTS.md')
+  assert.match(agentsMd, /# Shared/)
+  assert.doesNotMatch(agentsMd, /Upstream/)
+  assert.ok(!has(repo, '.claude', 'hooks'), 'no upstream hook')
+  assert.ok(!has(repo, '.claude', 'settings.json'), 'no upstream settings')
+  assert.deepEqual(lock(repo).hooks, {})
+})
+
+test('a name in two sources stops the sync and names both sources', () => {
+  const repo = newRepo()
+  const extra = extraCatalog()
+  writeIntent(repo, { from: CATALOG, skills: ['hello-rules'], agents: [], sources: [{ from: extra, skills: ['hello-rules'] }] })
+  const r = run(repo, [])
+  assert.equal(r.status, 1)
+  assert.match(r.stderr, /skill "hello-rules" comes from two sources/)
+  assert.ok(r.stderr.includes(CATALOG) && r.stderr.includes(extra), 'both sources named')
+  assert.ok(!has(repo, '.claude'), 'nothing written')
+})
+
+test('dropping an extra source removes what it installed', () => {
+  const repo = newRepo()
+  const extra = extraCatalog()
+  writeIntent(repo, { from: CATALOG, skills: ['hello-rules'], agents: [], sources: [{ from: extra, skills: ['emails'] }] })
+  run(repo, [])
+  writeIntent(repo, { from: CATALOG, skills: ['hello-rules'], agents: [] })
+  const r = run(repo, [])
+  assert.equal(r.status, 0, r.stderr)
+  assert.ok(!has(repo, '.claude', 'skills', 'emails'))
+  assert.ok(!has(repo, '.claude', 'agents', 'writer.md'))
+  assert.ok(has(repo, '.claude', 'skills', 'hello-rules'))
+  assert.equal(config(repo).sources, undefined)
+})
+
+test('--from on the command line keeps the recorded sources', () => {
+  const repo = newRepo()
+  const extra = extraCatalog()
+  writeIntent(repo, { from: CATALOG, skills: ['hello-rules'], agents: [], sources: [{ from: extra, skills: ['emails'] }] })
+  const r = run(repo, ['--from', CATALOG, '--skill', 'review-flow'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.ok(has(repo, '.claude', 'skills', 'emails'), 'the extra skill stays')
+  assert.equal(config(repo).sources.length, 1)
+})
+
+test('a "sources" entry with no "from" fails', () => {
+  const repo = newRepo()
+  writeIntent(repo, { from: CATALOG, skills: ['hello-rules'], agents: [], sources: [{ skills: ['emails'] }] })
+  const r = run(repo, [])
+  assert.equal(r.status, 1)
+  assert.match(r.stderr, /"sources" entry 1 in skills-syncer.json needs a "from"/)
+})
+
+test('--all syncs extra sources, and a broken one fails only its repo', () => {
+  const fleet = mkdtempSync(join(tmpdir(), 'sst-fleet-'))
+  const extra = extraCatalog()
+  for (const [name, from] of [['a', extra], ['b', extra], ['bad', join(fleet, 'no-such-extra')]]) {
+    mkdirSync(join(fleet, name))
+    writeIntent(join(fleet, name), { from: CATALOG, skills: ['hello-rules'], agents: [], sources: [{ from, skills: ['emails'] }] })
+  }
+  const r = run(fleet, ['--all', '--root', fleet])
+  assert.equal(r.status, 1)
+  assert.match(r.stdout, /synced 2 repo\(s\).*failed: bad/)
+  assert.ok(has(join(fleet, 'a'), '.claude', 'skills', 'emails'))
+  assert.ok(has(join(fleet, 'b'), '.claude', 'skills', 'emails'))
+  assert.ok(!has(join(fleet, 'bad'), '.claude'))
+})
+
+// A github: source is cloned over the network. git's insteadOf turns
+// https://github.com/ into a local folder, so the real clone path runs offline.
+function githubUpstream() {
+  const hub = mkdtempSync(join(tmpdir(), 'sst-hub-'))
+  const up = join(hub, 'acme', 'extra.git')
+  mkdirSync(join(up, 'skills', 'emails'), { recursive: true })
+  /** @param {...string} args @returns {string} */
+  const git = (...args) =>
+    spawnSync('git', ['-C', up, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { encoding: 'utf8' }).stdout.trim()
+  /** @param {string} rel @param {string} body @param {string} tag @returns {string} the new commit */
+  const commit = (rel, body, tag) => {
+    mkdirSync(dirname(join(up, rel)), { recursive: true })
+    writeFileSync(join(up, rel), body)
+    git('add', '-A')
+    git('commit', '-qm', tag)
+    git('tag', tag)
+    return git('rev-parse', 'HEAD')
+  }
+  git('init', '-q')
+  const env = {
+    ...process.env,
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: `url.file://${hub}/.insteadOf`,
+    GIT_CONFIG_VALUE_0: 'https://github.com/',
+  }
+  return { commit, env }
+}
+/** @returns {string[]} the temp clones skills-syncer has left in tmpdir */
+const clones = () => readdirSync(tmpdir()).filter((n) => n.startsWith('skills-syncer-'))
+
+test('the lock records the commit of a github: source and reports a move', () => {
+  const gh = githubUpstream()
+  const first = gh.commit('skills/emails/SKILL.md', 'EMAILS v1\n', 'v1')
+  const second = gh.commit('skills/emails/SKILL.md', 'EMAILS v2\n', 'v2')
+  const repo = newRepo()
+  writeIntent(repo, { from: CATALOG, skills: ['hello-rules'], agents: [], sources: [{ from: 'github:acme/extra#v1', skills: ['emails'] }] })
+  let r = run(repo, [], { env: gh.env })
+  assert.equal(r.status, 0, r.stderr)
+  assert.equal(read(repo, '.claude', 'skills', 'emails', 'SKILL.md'), 'EMAILS v1\n')
+  assert.deepEqual(lock(repo).commits, { 'github:acme/extra': first }, 'keyed without the #ref')
+  assert.doesNotMatch(r.stdout, /moved/)
+
+  writeIntent(repo, { ...config(repo), sources: [{ from: 'github:acme/extra#v2', skills: ['emails'] }] })
+  r = run(repo, [], { env: gh.env })
+  assert.equal(r.status, 0, r.stderr)
+  assert.equal(read(repo, '.claude', 'skills', 'emails', 'SKILL.md'), 'EMAILS v2\n')
+  assert.equal(lock(repo).commits['github:acme/extra'], second)
+  assert.ok(r.stdout.includes(`moved github:acme/extra: ${first.slice(0, 7)} → ${second.slice(0, 7)}`), r.stdout)
+})
+
+test('a new commit that changes no selected item leaves the lock alone', () => {
+  const gh = githubUpstream()
+  const first = gh.commit('skills/emails/SKILL.md', 'EMAILS v1\n', 'v1')
+  const repo = newRepo()
+  writeIntent(repo, { from: CATALOG, skills: ['hello-rules'], agents: [], sources: [{ from: 'github:acme/extra', skills: ['emails'] }] })
+  run(repo, [], { env: gh.env })
+  const before = read(repo, 'skills-syncer-lock.json')
+
+  gh.commit('README.md', 'docs only\n', 'docs')
+  const r = run(repo, [], { env: gh.env })
+  assert.equal(r.status, 0, r.stderr)
+  assert.equal(read(repo, 'skills-syncer-lock.json'), before, 'lock not rewritten')
+  assert.equal(lock(repo).commits['github:acme/extra'], first)
+  assert.doesNotMatch(r.stdout, /moved/)
+})
+
+test('a temp clone is removed when the sync fails after it', () => {
+  const gh = githubUpstream()
+  gh.commit('skills/hello-rules/SKILL.md', 'UPSTREAM HELLO\n', 'v1')
+  const repo = newRepo()
+  writeIntent(repo, { from: CATALOG, skills: ['hello-rules'], agents: [], sources: [{ from: 'github:acme/extra', skills: ['hello-rules'] }] })
+  const left = clones()
+  const r = run(repo, [], { env: gh.env })
+  assert.equal(r.status, 1)
+  assert.match(r.stderr, /comes from two sources/)
+  assert.deepEqual(clones(), left, 'no clone left behind')
+})
+
+test('"sources" of the wrong shape fails cleanly, also under --all', () => {
+  const fleet = mkdtempSync(join(tmpdir(), 'sst-fleet-'))
+  /** @type {Record<string, any>} */
+  const cases = {
+    object: { from: CATALOG, skills: ['emails'] },
+    string: [{ from: CATALOG, skills: 'emails' }],
+  }
+  for (const [name, sources] of Object.entries(cases)) {
+    mkdirSync(join(fleet, name))
+    writeIntent(join(fleet, name), { from: CATALOG, skills: ['hello-rules'], agents: [], sources })
+    const r = run(join(fleet, name), [])
+    assert.equal(r.status, 1)
+    assert.doesNotMatch(r.stderr, /TypeError/)
+  }
+  assert.match(run(join(fleet, 'object'), []).stderr, /"sources" in skills-syncer.json must be a list/)
+  assert.match(run(join(fleet, 'string'), []).stderr, /"sources" entry 1 in skills-syncer.json: "skills" must be a list/)
+
+  mkdirSync(join(fleet, 'good'))
+  writeIntent(join(fleet, 'good'), { from: CATALOG, skills: ['hello-rules'], agents: [] })
+  const r = run(fleet, ['--all', '--root', fleet])
+  assert.equal(r.status, 1)
+  assert.match(r.stdout, /synced 1 repo\(s\)/, 'the healthy repo still synced')
+})
+
+test('one source listed twice fails before any clone', () => {
+  const repo = newRepo()
+  const extra = extraCatalog()
+  writeIntent(repo, { from: CATALOG, skills: ['hello-rules'], agents: [], sources: [{ from: extra, skills: ['emails'] }, { from: extra, agents: ['writer'] }] })
+  const r = run(repo, [])
+  assert.equal(r.status, 1)
+  assert.match(r.stderr, /is listed twice/)
+})
+
+test('an agent clash says which skills pulled the agent in', () => {
+  const repo = newRepo()
+  const extra = extraCatalog()
+  // both catalogs ship a "worker" agent; each one comes in through a skill
+  mkdirSync(join(extra, 'skills', 'drafts'))
+  writeFileSync(join(extra, 'skills', 'drafts', 'SKILL.md'), 'DRAFTS\n')
+  writeFileSync(join(extra, 'agents', 'worker.md'), 'UPSTREAM WORKER\n')
+  writeFileSync(join(extra, 'skill-agents.json'), JSON.stringify({ drafts: ['worker'] }))
+  writeIntent(repo, { from: CATALOG, skills: ['review-flow'], agents: [], sources: [{ from: extra, skills: ['drafts'] }] })
+  const r = run(repo, [])
+  assert.equal(r.status, 1)
+  assert.match(r.stderr, /agent "worker" comes from two sources/)
+  assert.match(r.stderr, /required by "review-flow"/)
+  assert.match(r.stderr, /required by "drafts"/)
+})
+
+test('--dry-run with an extra source writes nothing', () => {
+  const repo = newRepo()
+  const extra = extraCatalog()
+  writeIntent(repo, { from: CATALOG, skills: ['hello-rules'], agents: [], sources: [{ from: extra, skills: ['emails'] }] })
+  const before = read(repo, 'skills-syncer.json')
+  const r = run(repo, ['--dry-run'])
+  assert.equal(r.status, 0, r.stderr)
+  assert.ok(!has(repo, '.claude'))
+  assert.ok(!has(repo, 'skills-syncer-lock.json'))
+  assert.equal(read(repo, 'skills-syncer.json'), before)
+})
+
+test('a skill moved from the main source to an extra one is kept and relabelled', () => {
+  const repo = newRepo()
+  const extra = extraCatalog()
+  run(repo, ['--from', extra, '--skill', 'emails'])
+  assert.equal(lock(repo).skills.emails.from, undefined)
+
+  writeIntent(repo, { from: CATALOG, skills: ['hello-rules'], agents: [], sources: [{ from: extra, skills: ['emails'] }] })
+  const r = run(repo, [])
+  assert.equal(r.status, 0, r.stderr)
+  assert.doesNotMatch(r.stderr, /repo-authored/)
+  // its hook goes, because only the main source gives hooks; the skill stays
+  assert.doesNotMatch(r.stdout, /removed skills/)
+  assert.equal(read(repo, '.claude', 'skills', 'emails', 'SKILL.md'), 'EMAILS v1\n')
+  assert.equal(lock(repo).skills.emails.from, extra)
+})
+
+test('a lock from local sources only has no commits field', () => {
+  const repo = newRepo()
+  run(repo, ['--from', CATALOG, '--skill', 'hello-rules'])
+  assert.equal(lock(repo).commits, undefined)
 })
