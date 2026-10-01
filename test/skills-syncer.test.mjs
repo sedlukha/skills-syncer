@@ -765,7 +765,8 @@ test('a re-sync with no change rewrites nothing', () => {
   const cat = hookCatalog()
   run(repo, ['--from', cat, '--skill', 'hello-rules'])
   const before = statSync(join(repo, '.claude', 'settings.json')).mtimeMs
-  const old = new Date(Date.now() - 60_000)
+  // whole seconds: a millisecond stamp can read back as ...0.999 on some systems
+  const old = new Date('2020-01-01T00:00:00Z')
   utimesSync(join(repo, '.claude', 'settings.json'), old, old)
 
   run(repo, [])
